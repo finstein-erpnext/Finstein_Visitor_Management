@@ -1,0 +1,12 @@
+[pre_model_sync]
+# Patches added in this section will be executed before doctypes are migrated
+
+[post_model_sync]
+# Patches added in this section will be executed after doctypes are migrated
+#
+# This app intentionally ships no patches. All setup — roles, permissions,
+# Visitor Types, gates, ID proof types, settings and the generated workflow —
+# lives in finstein_visitor_management/setup.py and is applied idempotently by the
+# before_migrate / after_migrate / after_install hooks. `bench install-app`
+# marks patches complete without running them, so patch-based setup silently
+# skips on every fresh site.

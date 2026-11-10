@@ -1,0 +1,116 @@
+{
+ "app": "finstein_visitor_management",
+ "charts": [
+  {
+   "chart_name": "Bookings by Room",
+   "label": "Bookings by Room"
+  }
+ ],
+ "content": "[{\"id\": \"crb-h-actions\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Quick Actions</b></span>\", \"col\": 12}}, {\"id\": \"crb-s-0\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"New Booking\", \"col\": 3}}, {\"id\": \"crb-s-1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Room Calendar\", \"col\": 3}}, {\"id\": \"crb-s-2\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"All Bookings\", \"col\": 3}}, {\"id\": \"crb-s-3\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Daily Booking Schedule\", \"col\": 3}}, {\"id\": \"crb-h-today\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Today</b></span>\", \"col\": 12}}, {\"id\": \"crb-c-0\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Today's Conference Bookings\", \"col\": 4}}, {\"id\": \"crb-c-1\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Pending Room Approvals\", \"col\": 4}}, {\"id\": \"crb-c-2\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Total Conference Rooms\", \"col\": 4}}, {\"id\": \"crb-h-use\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Room Use</b></span>\", \"col\": 12}}, {\"id\": \"crb-ch-0\", \"type\": \"chart\", \"data\": {\"chart_name\": \"Bookings by Room\", \"col\": 12}}, {\"id\": \"crb-h-browse\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Browse</b></span>\", \"col\": 12}}, {\"id\": \"crb-k-0\", \"type\": \"card\", \"data\": {\"card_name\": \"Rooms & Reports\", \"col\": 4}}]",
+ "creation": "2026-05-13 00:00:00.000000",
+ "custom_blocks": [],
+ "docstatus": 0,
+ "doctype": "Workspace",
+ "for_user": "",
+ "hide_custom": 0,
+ "icon": "calendar",
+ "idx": 0,
+ "is_hidden": 0,
+ "label": "Conference Rooms",
+ "links": [
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Rooms & Reports",
+   "link_count": 2,
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Conference Room",
+   "link_count": 0,
+   "link_to": "Conference Room",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Room Utilization",
+   "link_count": 0,
+   "link_to": "Room Utilization",
+   "link_type": "Report",
+   "onboard": 0,
+   "type": "Link"
+  }
+ ],
+ "modified": "2026-10-16 10:40:00.000000",
+ "modified_by": "Administrator",
+ "module": "Conference Room",
+ "name": "Conference Rooms",
+ "number_cards": [
+  {
+   "label": "Today's Conference Bookings",
+   "number_card_name": "Today's Conference Bookings"
+  },
+  {
+   "label": "Pending Room Approvals",
+   "number_card_name": "Pending Room Approvals"
+  },
+  {
+   "label": "Total Conference Rooms",
+   "number_card_name": "Total Conference Rooms"
+  }
+ ],
+ "owner": "Administrator",
+ "parent_page": "",
+ "public": 1,
+ "quick_lists": [],
+ "restrict_to_domain": "",
+ "roles": [
+  {
+   "role": "Facility Manager"
+  },
+  {
+   "role": "System Manager"
+  }
+ ],
+ "sequence_id": 30.0,
+ "shortcuts": [
+  {
+   "color": "Blue",
+   "doc_view": "New",
+   "label": "New Booking",
+   "link_to": "Conference Room Booking",
+   "type": "DocType"
+  },
+  {
+   "color": "Green",
+   "doc_view": "Calendar",
+   "label": "Room Calendar",
+   "link_to": "Conference Room Booking",
+   "type": "DocType"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "All Bookings",
+   "link_to": "Conference Room Booking",
+   "type": "DocType"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "",
+   "label": "Daily Booking Schedule",
+   "link_to": "Daily Booking Schedule",
+   "type": "Report"
+  }
+ ],
+ "title": "Conference Rooms",
+ "type": "Workspace"
+}

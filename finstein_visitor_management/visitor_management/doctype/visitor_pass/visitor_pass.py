@@ -1,0 +1,3397 @@
+# For license information, please see license.txt
+
+import re
+import secrets
+from io import BytesIO
+from urllib.parse import urlencode
+
+import frappe
+import qrcode
+from frappe import _
+from frappe.model.document import Document
+from frappe.model.naming import getseries
+from frappe.utils import (
+	add_days,
+	cint,
+	date_diff,
+	formatdate,
+	get_time,
+	get_url,
+	getdate,
+	now_datetime,
+	strip_html,
+	today,
+	validate_email_address,
+)
+
+from finstein_visitor_management.visitor_management import approval_tasks
+from finstein_visitor_management.visitor_management import phone as vms_phone
+from finstein_visitor_management.visitor_management import settings as vms_settings
+from finstein_visitor_management.visitor_management.id_numbers import (
+	save_masked_version,
+	set_shown_id,
+	shown_id,
+	take_typed_id,
+)
+from finstein_visitor_management.visitor_management.lifecycle import (
+	call_off_pass_arrangements,
+	derive_hospitality_meal_plan,
+	ensure_hospitality_request,
+	normalize_visitor_pass,
+)
+from finstein_visitor_management.visitor_management.link_details import fill_from_link
+from finstein_visitor_management.visitor_management.mail import esc, send_in_background
+from finstein_visitor_management.visitor_management.uploads import (
+	adopt_stray_uploads,
+	copy_file_row,
+	share_files_from_source_pass,
+)
+from finstein_visitor_management.visitor_management.validators import (
+	foreign_national_id_types,
+	id_proof_error_message,
+	is_valid_for_foreign_nationals,
+	mask_id_number,
+	normalise_id_number,
+	validate_id,
+)
+
+# Lane names are derived from each Visitor Type's approver_role — there is no
+# fixed list of approvers. `workflow_builder` generates a matching workflow state
+# and transitions for every role in use, so a Visitor Type pointed at any role
+# routes correctly without a code change.
+from finstein_visitor_management.visitor_management.workflow_builder import (
+	ACTION_REJECT,
+	APPROVED_STATES,
+	DRAFT,
+	GATE_ROLE,
+	REJECTED,
+	WALK_IN_CHANNEL,
+	WITHDRAWN,
+	lane_for_role,
+	pending_lanes,
+)
+
+# Fields that belong to one visitor-type layout only, keyed by that layout — so
+# a custom Visitor Type reusing a shipped layout gets the same set. Used both to
+# summarise a pass and to clear values that no longer apply after the type
+# changes (see VisitorPass._clear_fields_from_other_layouts).
+LAYOUT_FIELDS = {
+	"Supplier": [
+		"supplier_visit_mode",
+		"supplier_link",
+		"purchase_order",
+		"delivery_note",
+		"goods_description",
+		"meeting_subject",
+		"nda_required",
+		"documents_shared",
+	],
+	"Customer": [
+		"crm_reference_type",
+		"crm_lead_opportunity",
+		"visit_category",
+		"sales_executive",
+		"products_discussed",
+		"meeting_outcome",
+		"followup_date",
+		"meeting_minutes",
+	],
+	"Contractor": [
+		"contractor_link",
+		"work_order_ref",
+		"tools_list",
+		"multi_day_pass",
+		"pass_valid_until",
+	],
+	"Candidate": [
+		"job_applicant_link",
+		"position_applied",
+		"candidate_interview_type",
+		"interview_panel",
+	],
+	# The VIP layout was missing from this map entirely, which meant its fields
+	# were the only ones never cleared when a pass belonged to some other type.
+	# Combined with `vip_category` being a Select whose options did not start
+	# with a blank line — so Frappe assigned the first option, "Board Member",
+	# to every pass that left it empty — Contractor, Customer, Supplier and
+	# Candidate passes were carrying
+	# `vip_category = Board Member` in reports and exports, on records where the
+	# VIP section is not even displayed.
+	"VIP": [
+		"vip_category",
+		"mdceo_notified",
+		"interpreter_required",
+		"interpreter_language",
+		"protocol_notes",
+	],
+}
+
+
+def _get_visitor_type_doc(visitor_type_name):
+	"""Fetch the linked Visitor Type master record (cached — this is a small,
+	frequently-read doc, so `get_cached_doc` avoids a DB round-trip on every
+	Visitor Pass save)."""
+	if not visitor_type_name:
+		return None
+	try:
+		return frappe.get_cached_doc("Visitor Type", visitor_type_name)
+	except frappe.DoesNotExistError:
+		return None
+
+
+def _get_home_country():
+	"""The configured home country (see visitor_management.settings)."""
+	return vms_settings.home_country()
+
+
+def _creates_passes_only_as_security(user=None):
+	"""Whether Security is the only role through which `user` may create a Visitor Pass."""
+	from frappe.permissions import get_valid_perms
+
+	user = user or frappe.session.user
+	if user in ("Administrator", "Guest"):
+		return False
+	roles = frappe.get_roles(user)
+	if GATE_ROLE not in roles:
+		return False
+	return not any(
+		cint(perm.get("create")) and not cint(perm.get("permlevel")) and perm.get("role") != GATE_ROLE
+		for perm in get_valid_perms("Visitor Pass", user)
+	)
+
+
+def note_for_staff(reference_doctype, reference_name, note):
+	"""Background job: leave `note` on a record, for a refusal the visitor was not told about.
+
+	Enqueued outside the request's transaction, because the refusal that follows
+	rolls back anything written inside it (see mail.send_in_background).
+	"""
+	if frappe.db.exists(reference_doctype, reference_name):
+		frappe.get_doc(reference_doctype, reference_name).add_comment("Info", note)
+
+
+class VisitorPass(Document):
+	# Aliases used by notification templates and external references.
+	# `visitor_name` is referenced by gate_security_alert.html and vms_prr_submitted notification.
+	# `company` is referenced by gate_security_alert.html as {{ doc.company }}.
+	@property
+	def visitor_name(self):
+		return self.visitor_full_name
+
+	@property
+	def company(self):
+		return self.company__organisation
+
+	def _visitor_type_flag(self, fieldname, default=0):
+		"""Read a behaviour flag off the linked Visitor Type master.
+
+		Behaviour is configured per type rather than branching on the type's
+		*name*, so a site can add e.g. a second executive-approval type without
+		touching this controller.
+		"""
+		visitor_type_doc = _get_visitor_type_doc(self.visitor_type)
+		if visitor_type_doc is None:
+			return cint(default)
+		return cint(getattr(visitor_type_doc, fieldname, default))
+
+	def validate(self):
+		# Nationality is mandatory. It defaults to the configured home country so
+		# that any creation path (portal, API, automation, import) that doesn't
+		# supply it still saves, instead of failing mandatory validation.
+		if not self.custom_nationality:
+			self.custom_nationality = _get_home_country()
+
+		self._refuse_generic_web_form_save()
+		self._clear_carried_over_visit()
+		self._keep_server_owned_fields()
+		self._keep_request_channel()
+		self._refuse_gate_pass_outside_walk_in()
+		self._force_draft_for_untrusted_creation()
+		self._track_submission_for_approval()
+		if self._is_withdrawal():
+			# The visit is off: nothing about it has to be valid any more (a draft
+			# with no photo yet, a date gone by, a host who has left), and the
+			# rules below would refuse exactly those passes. What an approver was
+			# sent stays locked, and the pass is final from here on.
+			self._lock_details_while_pending()
+			self._take_rejection_reason()
+			self._sync_status_with_workflow()
+			return
+		# A newly typed ID number becomes the real one before the checks below.
+		self._take_typed_id_numbers()
+		self._lock_details_while_pending()
+		self._sanitize_free_text()
+		self._fill_from_linked_records()
+		self._validate_visitor_type_active()
+		self._validate_mobile_number()
+		self._sync_status_with_workflow()
+		normalize_visitor_pass(self)
+		self._clear_fields_from_other_layouts()
+		self._align_workflow_lane_with_visitor_type()
+		self._take_rejection_reason()
+		self._assert_decided_by_current_approver()
+		self._route_approval()
+		self._require_fields_the_form_requires()
+		self._validate_group_members()
+		self._warn_conference_room_busy()
+		self._require_documents_to_leave_draft()
+		self._require_meal_type_to_send()
+		self._settle_executive_notification()
+		self._validate_not_blacklisted()
+		self._validate_schedule()
+		self._validate_formats()
+		self._validate_host_active()
+		self._set_id_proof_keys()
+		self._validate_duplicate_pass()
+		self._validate_visit_duration()
+		self._set_shown_id_numbers()
+
+	def _validate_visitor_type_active(self):
+		"""A retired Visitor Type cannot be put on a pass.
+
+		No approval lane is generated for an inactive type, so such a pass could
+		never be approved. Checked when the type is chosen — a new pass, or a
+		changed type — so a pass raised while the type was active keeps saving.
+		Visitor Invitation applies the same rule.
+		"""
+		if not self.visitor_type or not (self.is_new() or self.has_value_changed("visitor_type")):
+			return
+		if not frappe.db.get_value("Visitor Type", self.visitor_type, "is_active"):
+			frappe.throw(
+				_("Visitor Type {0} is not active.").format(self.visitor_type),
+				title=_("Inactive Visitor Type"),
+			)
+
+	def _validate_mobile_number(self):
+		"""Refuse a number that is not a real mobile number, as the invitation does.
+
+		The pass only reformatted what was typed, so "12345" or a string of nines
+		went all the way to the gate and was found out when security tried to ring
+		the visitor. Checked when the number is entered or changed: a pass saved
+		before this rule can still move through approval and the gate.
+		"""
+		if not self.mobile_number or not (self.is_new() or self.has_value_changed("mobile_number")):
+			return
+		self.mobile_number = vms_phone.validate_mobile(self.mobile_number)
+
+	def _take_typed_id_numbers(self):
+		"""Move a full ID number typed into "ID Proof Number" onto the real field.
+
+		id_proof_number keeps the real number in the database; people see and type
+		into id_proof_masked. See visitor_management/id_numbers.py.
+		"""
+		amended = self._pass_being_amended()
+		source_full = self._full_id_from_source() or (amended.id_proof_number if amended else None)
+		self.id_proof_number = take_typed_id(self, source_full)
+		if not self.id_proof_number:
+			frappe.throw(_("ID Proof Number is required."), title=_("Missing ID Proof Number"))
+		self.id_proof_source = None
+		for row in self.get("group_members") or []:
+			row.id_proof_number = take_typed_id(row, self._member_id_from_amended(row, amended))
+
+	def _pass_being_amended(self):
+		"""The cancelled pass a new amended copy is made from, if the user may open it.
+
+		Amend copies the pass as the browser has it. For everyone who sees only the
+		masked number that is "XXXXXX234F" and no real number, so the copy could
+		not be saved ("ID Proof Number Needed") unless the user retyped an ID they
+		are not allowed to see. The real numbers are carried over on the server
+		instead, as a returning visitor's are (_full_id_from_source), and only
+		where the masked form on the copy still matches (take_typed_id).
+		"""
+		source = self.get("amended_from")
+		if not (self.is_new() and source) or not frappe.db.exists("Visitor Pass", source):
+			return None
+		if not frappe.has_permission("Visitor Pass", "read", doc=source):
+			return None
+		# get_doc reads the stored values; the masking is applied to what is sent out.
+		amended = frappe.get_doc("Visitor Pass", source)
+		return amended if amended.docstatus == 2 else None
+
+	@staticmethod
+	def _member_id_from_amended(row, amended):
+		"""Real ID number of the accompanying visitor `row` was copied from on Amend.
+
+		Matched on the masked form. Two people can share one (the same last four
+		characters): then the name decides, and if that does not settle it the
+		number has to be typed again.
+		"""
+		shown = (row.get("id_proof_masked") or "").strip()
+		if not amended or not shown:
+			return None
+		matches = [
+			member
+			for member in amended.get("group_members") or []
+			if member.id_proof_number and mask_id_number(member.id_proof_number) == shown
+		]
+		if len({member.id_proof_number for member in matches}) > 1:
+			name = (row.get("visitor_name") or "").strip()
+			matches = [member for member in matches if (member.visitor_name or "").strip() == name]
+		numbers = {member.id_proof_number for member in matches}
+		return numbers.pop() if len(numbers) == 1 else None
+
+	def _full_id_from_source(self):
+		"""Real number of the pass a returning visitor's details were copied from."""
+		source = self.get("id_proof_source")
+		if not source or source == self.name or not frappe.db.exists("Visitor Pass", source):
+			return None
+		# Only a pass the user may open: otherwise naming any pass here would copy a
+		# stranger's ID number into this one.
+		if not frappe.has_permission("Visitor Pass", "read", doc=source):
+			return None
+		return frappe.db.get_value("Visitor Pass", source, "id_proof_number")
+
+	def _set_shown_id_numbers(self):
+		set_shown_id(self)
+		for row in self.get("group_members") or []:
+			set_shown_id(row)
+
+	def _fill_from_linked_records(self):
+		"""Host and candidate details, copied from the records picked.
+
+		These were `fetch_from` fields, which read the master with the saver's
+		own rights and so required READ on Employee / Job Applicant for every
+		role that raises a pass (see visitor_management/link_details.py).
+		"""
+		fill_from_link(
+			self,
+			"person_to_visit",
+			"Employee",
+			{"host_name": "employee_name", "host_department": "department", "host_email": "user_id"},
+		)
+		fill_from_link(self, "job_applicant_link", "Job Applicant", {"position_applied": "job_title"})
+
+	def _refuse_generic_web_form_save(self):
+		"""Anonymous passes come in through portal.submit_pre_registration only.
+
+		Frappe's generic web form endpoint (web_form.accept, guest-callable) copies
+		every field on the pre-registration form straight from the request — so an
+		attachment field (ID scan, photo, visa copy) could be set to any URL,
+		skipping the upload checks the portal endpoint applies. The form's own
+		script never uses it.
+		"""
+		if frappe.flags.in_web_form and frappe.session.user == "Guest":
+			frappe.throw(
+				_("Please submit your details through your pre-registration link."),
+				frappe.PermissionError,
+			)
+
+	# What belongs to one visit only: its approval, gate movements and the
+	# hospitality raised for it. Marked no_copy in the DocType for the desk's
+	# Duplicate/Amend; server-side frappe.copy_doc ignores no_copy by default.
+	VISIT_ONLY_FIELDS = (
+		"approved_by",
+		"approval_date",
+		"badge_number",
+		"qr_code_image",
+		"gate_verified_photo",
+		"gate_verified_on",
+		"gate_verified_by",
+		"actual_checkin",
+		"actual_checkout",
+		"no_show",
+		"current_location",
+		"item_verification_status",
+		"items_verified",
+		"all_items_verified",
+		"hospitality_request",
+		"hospitality_overall_status",
+		"food_status",
+		"food_dept_staff_assigned",
+		"qr_token",
+	)
+
+	def _clear_carried_over_visit(self):
+		"""An amended copy is a new visit: it must not inherit the cancelled one's
+		approval, check-in times, QR code or hospitality request (which would then
+		be reused and resynced for the wrong pass)."""
+		if not (self.is_new() and self.amended_from):
+			return
+		for fieldname in self.VISIT_ONLY_FIELDS:
+			self.set(fieldname, None)
+
+	# Written by the server only: the Hospitality Request link by lifecycle.py, the
+	# QR token at approval (on_submit).
+	SERVER_OWNED_FIELDS = (
+		"hospitality_request",
+		"qr_token",
+		# Who may decide the pass (approval_tasks), and the reminder clock: a
+		# client that wrote these could name itself the approver.
+		"routed_approver",
+		"current_approvers",
+		"pending_since",
+		"approval_reminder_sent_on",
+	)
+
+	def _keep_server_owned_fields(self):
+		"""Hold the Hospitality Request link and the QR token at their stored values.
+
+		Both are read-only on the form, but Frappe does not enforce read_only on a
+		save: a request carrying `hospitality_request` pointed the pass at someone
+		else's request, which the next sync then rewrote with this visit's meals
+		and room. The QR token is what the gate checks a scanned code against, so
+		one chosen by the client would make a forged QR code valid.
+		"""
+		stored = {}
+		if not self.is_new():
+			before = self.get_doc_before_save()
+			stored = (
+				before.as_dict()
+				if before
+				else frappe.db.get_value(
+					self.doctype, self.name, list(self.SERVER_OWNED_FIELDS), as_dict=True
+				)
+				or {}
+			)
+		for fieldname in self.SERVER_OWNED_FIELDS:
+			self.set(fieldname, stored.get(fieldname))
+
+		# The invitation link is what the portal trusts to hand a pass to the
+		# holder of that invitation's link (portal.existing_pass_for). Only the
+		# portal's own save sets it, as trusted server code (ignore_permissions);
+		# through the API, staff could otherwise pair an invitation with someone
+		# else's pass. A System Manager may correct it.
+		if self.flags.ignore_permissions or "System Manager" in frappe.get_roles():
+			return
+		if self.is_new():
+			self.visitor_invitation = None
+		else:
+			before = self.get_doc_before_save()
+			self.visitor_invitation = (
+				before.get("visitor_invitation")
+				if before
+				else frappe.db.get_value(self.doctype, self.name, "visitor_invitation")
+			)
+
+	def _keep_request_channel(self):
+		"""The "Walk-In" channel is written by the gate's New Walk-In form only (walk_in.py).
+
+		The channel decides who may send the pass for approval: the workflow lets
+		Security submit walk-in passes it raised. A REST call or a route option
+		that set it would hand a guard that right on any pass, so a save that
+		moves the channel to or from Walk-In keeps the stored value instead.
+		"""
+		if self.flags.get("vms_walk_in"):
+			self.request_channel = WALK_IN_CHANNEL
+			return
+		if self.is_new():
+			if self.request_channel == WALK_IN_CHANNEL:
+				self.request_channel = "Desk"
+			return
+		before = self.get_doc_before_save()
+		stored = (
+			before.get("request_channel")
+			if before
+			else frappe.db.get_value(self.doctype, self.name, "request_channel")
+		)
+		if WALK_IN_CHANNEL in (stored, self.request_channel):
+			self.request_channel = stored
+
+	def _refuse_gate_pass_outside_walk_in(self):
+		"""Security registers a visitor through New Walk-In, not the full pass form.
+
+		Security may create passes so that the walk-in form can, and it edits only
+		the passes it raised (permissions.py). A guard whose only way to create a
+		pass is that role is sent to the short form, so every pass a guard raises
+		is a walk-in the workflow lets them send for approval.
+		"""
+		if not self.is_new() or self.flags.get("vms_walk_in") or self.flags.ignore_permissions:
+			return
+		if not _creates_passes_only_as_security():
+			return
+		frappe.throw(
+			_("Register a visitor at the gate with New Walk-In."),
+			frappe.PermissionError,
+			title=_("Use New Walk-In"),
+		)
+
+	def _track_submission_for_approval(self):
+		"""Record who sent the pass for approval. Only the server writes the field.
+
+		Set when the pass enters an approval lane from outside one, cleared when it
+		goes back to Draft (Reapply), and put back at every other save: `read_only`
+		binds the form only, and a value a request sends would otherwise be saved.
+		That user may not decide the pass (_assert_decided_by_current_approver).
+		"""
+		lanes = pending_lanes()
+		before_state = self._stored_state()
+		if self.workflow_state in lanes and before_state not in lanes:
+			self.submitted_for_approval_by = frappe.session.user
+			# Read by the checks that apply only as the pass goes for approval.
+			self.flags.vms_sent_for_approval = True
+		elif self.workflow_state in (DRAFT, None, ""):
+			self.submitted_for_approval_by = None
+		elif self.is_new():
+			self.submitted_for_approval_by = None
+		else:
+			before = self.get_doc_before_save()
+			self.submitted_for_approval_by = (
+				before.get("submitted_for_approval_by")
+				if before
+				else frappe.db.get_value(self.doctype, self.name, "submitted_for_approval_by")
+			)
+
+	def _changed_since_saved(self, *fieldnames):
+		"""Whether any of `fieldnames` differs from the stored pass (always True for a new one).
+
+		Compared as text: the browser sends "2026-10-14" for a date the database
+		returns as a date, which `has_value_changed` reports as a change.
+		"""
+		before = None if self.is_new() else self.get_doc_before_save()
+		if before is None:
+			return True
+		return any(_as_text(before.get(f)) != _as_text(self.get(f)) for f in fieldnames)
+
+	# What the approver is asked to approve. Changing any of it while the pass
+	# waits in an approval lane would have the approver sign off a different visit
+	# from the one sent to them — and an approver who put another host on the
+	# pass was no longer its host, so could approve it themselves.
+	LOCKED_WHILE_PENDING = (
+		"visitor_full_name",
+		"id_proof_type",
+		"id_proof_number",
+		"mobile_number",
+		"email_id",
+		"person_to_visit",
+		"visit_date",
+		"pass_valid_until",
+		"multi_day_pass",
+		"visitor_type",
+	)
+	LOCKED_MEMBER_FIELDS = ("visitor_name", "id_proof_type", "id_proof_number", "mobile_number")
+
+	def _lock_details_while_pending(self):
+		"""Only a System Manager changes the visitor or the visit while it awaits approval.
+
+		The workflow lets the approver role edit a pending pass (allow_edit), and
+		Frappe applies that to every field alike, so an approver could change who
+		is coming, when, and to see whom. The form shows these fields read-only
+		while pending; this is the rule.
+		"""
+		if self.is_new() or cint(self.docstatus) != 0:
+			return
+		before = self.get_doc_before_save()
+		if not before or before.workflow_state not in pending_lanes():
+			return
+		if "System Manager" in frappe.get_roles():
+			return
+
+		changed = [
+			_(self.meta.get_label(fieldname))
+			for fieldname in self.LOCKED_WHILE_PENDING
+			if self._changed_since_saved(fieldname)
+		]
+
+		def members(doc):
+			return [
+				tuple(_as_text(row.get(f)) for f in self.LOCKED_MEMBER_FIELDS)
+				for row in doc.get("group_members") or []
+			]
+
+		if cint(before.is_group_visit) != cint(self.is_group_visit) or members(before) != members(self):
+			changed.append(_(self.meta.get_label("group_members")))
+		if changed:
+			frappe.throw(
+				_(
+					"{0} cannot be changed while this pass is awaiting approval. "
+					"Send it back to Draft (Reject, then Reapply) to change visitor details."
+				).format(", ".join(changed)),
+				title=_("Pass Awaiting Approval"),
+			)
+
+	def _force_draft_for_untrusted_creation(self):
+		"""A pass created by an anonymous visitor always starts in Draft.
+
+		The approval state is the app's only gate credential — `visitor_gate`
+		admits an Approved pass — so it must be earned through the workflow, never
+		asserted by the request that creates the record. Frappe's Web Form
+		`accept` binds every field listed in `web_form_fields` straight from the
+		POST body, and `hidden` is a rendering flag rather than an authorization
+		boundary; the governance fields have been unbound there, but this is the
+		control that actually holds, on every path into the doctype.
+
+		Only creation is forced. Once staff advance a pass through the workflow
+		the states are legitimate, so an existing record is left alone.
+		"""
+		if not self.is_new():
+			return
+		if frappe.session.user != "Guest":
+			return
+
+		self.status = "Draft"
+		self.workflow_state = "Draft"
+		self.docstatus = 0
+		# Provenance is a statement about how the record arrived, so the server
+		# states it rather than accepting the caller's word for it.
+		self.entry_type = "New"
+		self.request_channel = "Portal"
+		# Approval and gate artefacts cannot pre-exist the approval itself.
+		for fieldname in (
+			"badge_number",
+			"approved_by",
+			"approval_date",
+			"qr_code_image",
+			"actual_checkin",
+			"actual_checkout",
+			"no_show",
+			"current_location",
+			"gate_verified_by",
+			"gate_verified_on",
+			"gate_verified_photo",
+			"qr_token",
+		):
+			self.set(fieldname, None)
+
+	# Free-text fields a visitor fills in themselves. Their values are rendered
+	# back to staff in datatable report cells and in Notification email bodies —
+	# Frappe's Jinja does not autoescape, and a report formatter writes raw HTML
+	# into the cell — so the audience for anything smuggled in here is the
+	# System Manager running the PII reports.
+	GUEST_TEXT_FIELDS = (
+		"visitor_full_name",
+		"company__organisation",
+		"purpose_of_visit",
+		"vehicle_number",
+		"tools_list",
+		"position_applied",
+		"meeting_subject",
+		"interview_panel",
+		# The Visitor Item rows are built from this text in before_save, after the
+		# rows themselves were cleaned here — so markup typed into "Items" reached
+		# the item names unstripped.
+		"items_carried",
+	)
+
+	# The same visitor also types into these child rows on the portal. They were
+	# left out above, so an item name carrying markup reached the gate and VIP
+	# alert emails and the portal's inline boot script unchanged.
+	GUEST_CHILD_TEXT_FIELDS = (
+		("visitor_items", ("item_name", "description", "serial_number")),
+		("group_members", ("visitor_name", "remarks")),
+	)
+
+	def _sanitize_free_text(self):
+		"""Remove markup from visitor-supplied text at the point it is stored.
+
+		Stripped rather than sanitised: `sanitize_html` keeps `<a>` and `<img>`,
+		which is the whole payload for a link-injection phish landing in a
+		Security or System Manager inbox. None of these fields — a person's name,
+		their employer, why they are visiting — has any legitimate use for
+		markup, so tags come out entirely.
+
+		Cleaning on the way in rather than at each render means a report column
+		or notification template added later cannot reintroduce the hole by
+		forgetting to escape.
+		"""
+
+		def clean(row, fieldnames):
+			for fieldname in fieldnames:
+				value = row.get(fieldname)
+				if not isinstance(value, str) or "<" not in value:
+					continue
+				cleaned = strip_html(value).strip()
+				if cleaned != value:
+					row.set(fieldname, cleaned)
+
+		clean(self, self.GUEST_TEXT_FIELDS)
+		for table, fieldnames in self.GUEST_CHILD_TEXT_FIELDS:
+			for row in self.get(table) or []:
+				clean(row, fieldnames)
+
+	def _sync_status_with_workflow(self):
+		"""Keep `status` telling the same story as `workflow_state`.
+
+		The two had drifted apart: the workflow moved Draft -> Pending -> Rejected
+		while `status` sat on "Draft" the whole way, so a rejected pass still
+		reported itself as a draft in every list, report and dashboard. `status`
+		did not even carry a Rejected option, which meant a notification condition
+		written as `doc.status == 'Rejected'` could never be true.
+
+		Only the approval half is derived here. Once a pass is approved the gate
+		owns `status` — Items Verified, Checked-In and Checked-Out are movements,
+		not approval states, and must not be overwritten by a later save.
+
+		Before approval (docstatus 0) `status` is derived and nothing else: the
+		gate moves a pass only after submit, and always through db.set_value, so
+		no save of a draft may carry any other value. `status` is read-only on
+		the form, but `frappe.client.set_value` does not honour read_only — the
+		owner of a draft could set it to "Checked-In" in one request, and the
+		Active Visitors / Daily Visitor Log reports (which read `status`) then
+		showed a visitor on site who had never been approved, and the Security
+		role's row scope (which admits Approved-and-later statuses) exposed the
+		draft to every guard.
+		"""
+		state = self.workflow_state
+
+		if cint(self.docstatus) == 0:
+			if state in pending_lanes():
+				self.status = "Pending Approval"
+			elif state == "Rejected":
+				self.status = "Rejected"
+			elif state == WITHDRAWN:
+				# Called off before anyone decided it. "Cancelled" is the status
+				# every list, report and the room calendar already treat as "this
+				# visit is not happening"; the workflow state says how it ended.
+				self.status = "Cancelled"
+			else:
+				# Draft, or no workflow state yet. Also what Reapply returns to,
+				# and what an amended or duplicated copy must start as.
+				self.status = "Draft"
+			return
+
+		if not state:
+			return
+
+		if state in pending_lanes():
+			self.status = "Pending Approval"
+		elif state == "Rejected":
+			self.status = "Rejected"
+		elif state == "Approved":
+			if self.status not in ("Items Verified", "Checked-In", "Checked-Out", "Cancelled"):
+				self.status = "Approved"
+
+	def _require_fields_the_form_requires(self):
+		"""What the form makes mandatory for some passes, required on the server as well.
+
+		visitor_pass.js marks these mandatory with toggle_reqd, which only the
+		browser enforces, so an import, an API call or a script saved a pass
+		without them. Not asked of the visitor's own portal save: the
+		pre-registration form does not collect them, and staff complete the draft.
+		"""
+		if cint(self.docstatus) != 0 or frappe.session.user == "Guest":
+			return
+		layout = self.visitor_type_layout or ""
+		required = []
+		if layout in ("Supplier", "Customer", "Contractor", "Candidate") and self.entry_type == "Existing":
+			required.append("existing_visitor_pass")
+		if layout == "Supplier" and self.supplier_visit_mode == "Meeting":
+			required.append("meeting_subject")
+		if layout == "Customer" and self.meeting_outcome == "Follow-Up Needed":
+			required.append("followup_date")
+		if layout == "VIP" and cint(self.interpreter_required):
+			required.append("interpreter_language")
+
+		missing = [_(self.meta.get_label(f)) for f in required if not self.get(f)]
+		if missing:
+			frappe.throw(
+				_("Please fill in {0} before saving this pass.").format(", ".join(missing)),
+				title=_("Missing Details"),
+			)
+
+	def _clear_fields_from_other_layouts(self):
+		"""Drop values belonging to a layout this pass is not using.
+
+		Two things make this necessary. `crm_reference_type` carries a doctype
+		default of "Lead", so every pass — Contractor, Candidate, anything —
+		gets saved with a Customer-only value it never displays; the client
+		clears it on load, which marks a freshly opened pass dirty and hides the
+		workflow Actions button behind Save. And when someone switches the
+		Visitor Type on an existing pass, the previous layout's answers would
+		otherwise stay in the database, invisible on screen but present in
+		reports and exports.
+		"""
+		keep = set(LAYOUT_FIELDS.get(self.visitor_type_layout or "", []))
+		for layout, fieldnames in LAYOUT_FIELDS.items():
+			if layout == self.visitor_type_layout:
+				continue
+			for fieldname in fieldnames:
+				if fieldname in keep or not self.get(fieldname):
+					continue
+				self.set(fieldname, None)
+
+		# The CRM link records where a NEW customer came from; the form shows it
+		# (and ensure_customer_crm_defaults keeps it) only for entry_type "New".
+		# A returning ("Existing") customer still got the "Lead" default saved,
+		# the form cleared it on every load, and the pass sat at "Not Saved" for
+		# everyone who opened it.
+		if self.visitor_type_layout == "Customer" and self.entry_type != "New":
+			self.crm_reference_type = None
+			self.crm_lead_opportunity = None
+
+	# ─────────────────────────────────────────────────────────
+	# BUSINESS VALIDATIONS
+	# ─────────────────────────────────────────────────────────
+	def _validate_not_blacklisted(self):
+		"""Stop a blacklisted visitor as soon as the pass leaves Draft.
+
+		`before_submit` already blocks the final Approve, but a workflow's
+		intermediate lanes keep docstatus 0, so a blacklisted visitor could sit
+		in an approver's queue until someone tried to approve them. Checking on
+		the way out of Draft keeps them out of the queue entirely, while still
+		allowing reception to save a draft and correct it.
+		"""
+		from finstein_visitor_management.visitor_management.doctype.visitor_blacklist.visitor_blacklist import (
+			_normalise_id,
+		)
+
+		state = (self.workflow_state or "Draft").strip()
+		if state in ("Draft", "Rejected", ""):
+			# A Draft is still allowed to save — reception may be mid-typing, and
+			# refusing here would strand them with a half-entered form. But it must
+			# not stay SILENT: the block only fired on Submit, so a receptionist
+			# entered the person's name, mobile, ID number, ID scan and photograph
+			# before learning they were barred. That is wasted work, an awkward
+			# moment at the desk, and a blocked person's identity documents now
+			# sitting in the database. Tell her the moment the name or ID matches.
+			early = self._blacklist_match()
+			if early and not self._blacklist_blocks():
+				# VMS Settings lets a match through: it is told and recorded when
+				# the pass goes for approval (_allow_blacklisted), not while drafting.
+				self._allow_blacklisted(frappe.get_doc("Visitor Blacklist", early), notify=False)
+			elif early and frappe.session.user == "Guest":
+				# The visitor's own save on the portal: they are told nothing.
+				# Security and the host are, once the draft is stored (on_update).
+				self.flags.portal_blacklist_match = early
+			elif early:
+				entry = frappe.get_doc("Visitor Blacklist", early)
+				self._advise_staff(
+					_(
+						"<b>{0}</b> is on the active blacklist (reason: {1}).<br>"
+						"This pass can be saved as a draft, but it cannot be sent "
+						"for approval. Stop collecting their documents."
+					).format(
+						frappe.utils.escape_html(entry.visitor_name or self.visitor_full_name),
+						frappe.utils.escape_html(entry.reason or _("Not specified")),
+					),
+					title=_("Blacklisted Visitor — Do Not Proceed"),
+					indicator="red",
+				)
+			return
+
+		match = self._blacklist_match()
+		if not match:
+			# No strong (ID, or corroborated name+mobile) match. A weak,
+			# single-field hit still deserves a human's attention rather than
+			# vanishing — see _warn_weak_blacklist_match.
+			self._warn_weak_blacklist_match()
+			return
+
+		blacklist = frappe.get_doc("Visitor Blacklist", match)
+		if not self._blacklist_blocks():
+			self._allow_blacklisted(blacklist)
+			return
+		self._alert_blacklist_match(blacklist)
+		# Name BOTH people, and say which detail matched. The receptionist is
+		# looking at a form that says "Vikash Sharma" — a message naming only one
+		# person leaves her unsure whether she mistyped, whether the system has
+		# the wrong record, or whether this really is the barred man under another
+		# name. Saying "the ID proof you entered belongs to Vikram Malhotra"
+		# tells her what to check and what to say to the person in front of her.
+		matched_on = (
+			_("ID proof number")
+			if blacklist.id_proof_number
+			and _normalise_id(self.id_proof_number) == _normalise_id(blacklist.id_proof_number)
+			else _("name and mobile number")
+		)
+		same_person = (self.visitor_full_name or "").strip().lower() == (
+			blacklist.visitor_name or ""
+		).strip().lower()
+		detail = (
+			_("This person is on the active blacklist.")
+			if same_person
+			else _("The {0} entered belongs to <b>{1}</b>, who is on the active blacklist.").format(
+				matched_on, blacklist.visitor_name
+			)
+		)
+		self._refuse(
+			# nosemgrep: frappe-translation-python-splitting - the backslashes are \n line breaks, the string is not split
+			_("At the desk: {0}\n{1}\nReason on file: {2}\n\nThe pass cannot be sent for approval.").format(
+				self.visitor_full_name or _("(no name entered)"),
+				detail,
+				blacklist.reason or _("Not specified"),
+			),
+			title=_("Access Denied — Blacklisted Visitor"),
+		)
+
+	@staticmethod
+	def _blacklist_blocks():
+		"""Whether a strong blacklist match stops the pass (VMS Settings → Blacklist Action).
+
+		The pass refused every match whatever the setting said, while the gate
+		(security_log.py) honours it: on "Alert Only" or "Log Only" a site let a
+		match through at the gate that could never have got a pass approved.
+		"""
+		return vms_settings.blacklist_action() == "Block Entry"
+
+	def _allow_blacklisted(self, blacklist, member=None, notify=True):
+		"""A match VMS Settings lets through: warn staff (Alert Only) and record it once.
+
+		`notify` is False while the pass is a Draft — the record and the mail to
+		the Security Alert Roles come when it goes for approval, once per entry
+		and person (a comment on the pass marks it done).
+		"""
+		action = vms_settings.blacklist_action()
+		person = member.visitor_name if member else self.visitor_full_name
+		if action == "Alert Only":
+			self._advise_staff(
+				_(
+					"<b>{0}</b> matches the active blacklist entry {1} (reason: {2}).<br>"
+					"VMS Settings allows the pass to continue; Security is told. "
+					"Verify their ID before allowing entry."
+				).format(
+					frappe.utils.escape_html(person or ""),
+					blacklist.name,
+					frappe.utils.escape_html(blacklist.reason or _("Not specified")),
+				),
+				title=_("Blacklist Warning"),
+			)
+		if not notify or self.is_new():
+			return
+		note = _(
+			"{0} matches the active blacklist entry {1}. Allowed to continue (VMS Settings: {2})."
+		).format(person, blacklist.name, _(action))
+		if frappe.db.exists(
+			"Comment",
+			{
+				"reference_doctype": self.doctype,
+				"reference_name": self.name,
+				"comment_type": "Info",
+				"content": note,
+			},
+		):
+			return
+		self.add_comment("Info", note)
+		self._alert_blacklist_match(
+			blacklist,
+			member=member,
+			outcome=f"Allowed to continue on Visitor Pass {self.name} (VMS Settings: {action}).",
+		)
+
+	def _blacklist_match(self):
+		"""Name of the active blacklist entry the lead visitor matches strongly, or None."""
+		from finstein_visitor_management.visitor_management.doctype.visitor_blacklist.visitor_blacklist import (
+			VisitorBlacklist,
+		)
+
+		return VisitorBlacklist.find_active_match(
+			id_proof_number=self.id_proof_number,
+			visitor_name=self.visitor_full_name,
+			id_proof_type=self.id_proof_type,
+			mobile_number=self.mobile_number,
+		)
+
+	def _advise_staff(self, message, title, indicator="orange"):
+		"""A blacklist or room warning for whoever is saving the pass — unless that is the visitor.
+
+		validate() also runs inside the portal's guest request, and anything queued
+		there goes back to that browser. An anonymous visitor was being shown the
+		name and reason on a blacklist entry, and the title of somebody else's
+		meeting. These are notes for staff; a visitor gets none of them.
+		"""
+		if frappe.session.user == "Guest":
+			return
+		frappe.msgprint(message, title=title, indicator=indicator)
+
+	def _refuse(self, message, title):
+		"""Stop the save with the reason — which the visitor on the portal is not given."""
+		if frappe.session.user == "Guest":
+			frappe.throw(
+				_("Your details could not be accepted. Please contact the person you are visiting."),
+				title=_("Not Accepted"),
+			)
+		frappe.throw(message, title=title)
+
+	def _record_portal_blacklist_match(self):
+		"""After a visitor's own portal save matched the blacklist: tell staff, once.
+
+		The draft is kept, as it is for reception (see _validate_not_blacklisted),
+		and it cannot leave Draft. The host finds a note on the pass and the form
+		shows the warning (onload); the Security Alert Roles are mailed.
+		"""
+		match = self.flags.pop("portal_blacklist_match", None)
+		if not match:
+			return
+		note = _(
+			"The details submitted through the visitor portal match the active blacklist entry {0}. "
+			"This pass cannot be sent for approval."
+		).format(match)
+		if frappe.db.exists(
+			"Comment",
+			{
+				"reference_doctype": self.doctype,
+				"reference_name": self.name,
+				"comment_type": "Info",
+				"content": note,
+			},
+		):
+			return  # the visitor saved the same draft again
+		self.add_comment("Info", note)
+		self._alert_blacklist_match(
+			frappe.get_doc("Visitor Blacklist", match),
+			outcome=(
+				f"Submitted through the visitor portal and kept as draft {self.name}. "
+				"It cannot be sent for approval."
+			),
+		)
+
+	def onload(self):
+		"""Give the form the blacklist match on a pass that has not been sent for approval.
+
+		The warning used to exist only as the message queued by a save. On the
+		first save of a new pass the form moves from its temporary name to the
+		saved one and Frappe closes any open dialog on the way, so the one save
+		that mattered most showed nothing. The form now draws it from here on
+		every load and after every save.
+		"""
+		if frappe.session.user == "Guest" or cint(self.docstatus) != 0:
+			return
+		# The Reject dialog asks for a reason only when VMS Settings requires one.
+		self.set_onload("require_rejection_reason", vms_settings.feature_on("require_rejection_reason"))
+		if (self.workflow_state or "Draft") not in ("Draft", "Rejected"):
+			return
+		# The form's warning says the pass cannot go for approval: true only when
+		# VMS Settings blocks a match (see _blacklist_blocks).
+		if not self._blacklist_blocks():
+			return
+		match = self._blacklist_match()
+		if not match:
+			return
+		entry = frappe.db.get_value("Visitor Blacklist", match, ["visitor_name", "reason"], as_dict=True)
+		self.set_onload(
+			"blacklist_match",
+			{"visitor_name": entry.visitor_name or self.visitor_full_name, "reason": entry.reason or ""},
+		)
+
+	def _warn_weak_blacklist_match(self):
+		"""Surface a visible, non-blocking warning when this visitor matches
+		an active blacklist entry on ONE weak identifier only (name or
+		mobile — not both, and not the ID number).
+
+		`VisitorBlacklist.find_active_match()` deliberately does not hard-block
+		on a single weak field any more (see its docstring: a shared name used
+		to bar a real, unrelated visitor). But silently doing nothing would
+		trade one failure for a worse one — a security team believes they
+		barred someone by name, the entry sits Active in the list, and it
+		never fires again. So this hands the decision to whoever is looking at
+		the pass right now: it names the matched entry and its reason and asks
+		them to verify ID by hand. It does NOT stop the save.
+		"""
+		from finstein_visitor_management.visitor_management.doctype.visitor_blacklist.visitor_blacklist import (
+			VisitorBlacklist,
+		)
+
+		weak = VisitorBlacklist.find_weak_match(
+			visitor_name=self.visitor_full_name,
+			mobile_number=self.mobile_number,
+		)
+		if not weak:
+			return
+
+		blacklist = frappe.get_doc("Visitor Blacklist", weak["name"])
+		self._advise_staff(
+			_(
+				"This visitor's {0} matches an active blacklist entry ({1}, reason: {2}), "
+				"but not strongly enough to block automatically.<br>"
+				"<b>Verify their ID before allowing entry.</b>"
+			).format(
+				_(weak["matched_on"]),
+				blacklist.name,
+				frappe.utils.escape_html(blacklist.reason or _("Not specified")),
+			),
+			title=_("Possible Blacklist Match — Verify ID"),
+			indicator="orange",
+		)
+
+	def _warn_conference_room_busy(self):
+		"""Tell the host at pick time that the room is taken, not at approval.
+
+		The room on a Visitor Pass is not booked when it is chosen — the
+		Conference Room Booking is only created once the pass is approved
+		(`lifecycle.ensure_conference_room_booking`). So a host picked an
+		already-booked room, saved with no complaint, submitted with no
+		complaint, and the clash surfaced to the APPROVER as "Room Already
+		Booked" — someone who did not choose the room, cannot easily change it,
+		and is now blocked on the host to pick another. Reported from the field.
+
+		This checks the same rule at the moment the room is chosen, using the
+		same helper the booking itself uses, so the two cannot drift apart.
+
+		It warns rather than blocks, deliberately. A room can free up between
+		now and approval (the other booking gets cancelled or rejected), the
+		real booking still validates authoritatively when it is created, and a
+		hard block here would stop a host recording an otherwise valid visit
+		because of a slot that may not even be taken by then. The point is that
+		nobody is surprised later.
+		"""
+		if not (self.conference_room and self.visit_date):
+			return
+		if not (self.expected_checkin and self.expected_checkout):
+			return
+		# A room is booked within one day; an overnight visit has no single slot.
+		if get_time(self.expected_checkout) <= get_time(self.expected_checkin):
+			return
+
+		from finstein_visitor_management.conference_room.doctype.conference_room_booking.conference_room_booking import (
+			find_conflicting_booking,
+		)
+
+		# Exclude the booking this pass already owns, or re-saving an approved
+		# pass would flag it as clashing with itself.
+		own = frappe.db.get_value(
+			"Conference Room Booking",
+			{"visitor_pass": self.name, "docstatus": ["<", 2]},
+			"name",
+		)
+		clash = find_conflicting_booking(
+			self.conference_room,
+			self.visit_date,
+			self.expected_checkin,
+			self.expected_checkout,
+			exclude=own,
+		)
+		if clash:
+			# Name the other meeting only to someone allowed to open that booking —
+			# the rule the booking's own clash message applies. To everyone else the
+			# room is simply taken: neither its title nor its id is theirs to see.
+			from finstein_visitor_management.permissions import has_conference_room_booking_permission
+
+			other = frappe.get_doc("Conference Room Booking", clash[0].name)
+			if has_conference_room_booking_permission(other, frappe.session.user):
+				what = frappe.utils.escape_html(clash[0].meeting_title or clash[0].name)
+			else:
+				what = _("another booking")
+			self._advise_staff(
+				_(
+					"{0} is already booked on {1} from {2} to {3} ({4}).<br>"
+					"This pass can still be saved, but the room will have to change "
+					"before it is approved."
+				).format(
+					self.conference_room,
+					frappe.format(self.visit_date, {"fieldtype": "Date"}),
+					clash[0].start_time,
+					clash[0].end_time,
+					what,
+				),
+				title=_("Room Already Booked"),
+			)
+
+	def _validate_group_members(self):
+		"""Keep a group pass honest: real members, counted, and each one screened.
+
+		A delegation, an audit team or a training batch arrives together for one
+		meeting. Before this, each person needed their own pass — fifteen
+		mandatory fields, a photo, an ID scan and a full approval lane each — so
+		reception improvised on paper and the building had no record of who was
+		actually inside. One pass now carries the group.
+
+		Three things have to hold, and the third is the one that matters most:
+
+		1. Ticking "Group Visit" without listing anyone is a mistake, not a
+		   group — the count and the gate would both be wrong.
+		2. `group_size` counts the lead visitor plus the rows, so the guard and
+		   the host see the number of people to expect, not the number of
+		   passengers behind the driver.
+		3. **Every member is screened against the blacklist.** Without this a
+		   group booking is a way to walk a barred person straight past the
+		   check the lead visitor goes through — the feature would be a hole,
+		   not a convenience. Uses the same matcher and the same warn-vs-block
+		   split as the lead visitor: a strong ID match or a corroborated
+		   name+mobile pair blocks the pass; a single weak identifier raises a
+		   visible warning naming the person, for a human to check at the desk.
+		"""
+		if not self.is_group_visit:
+			# Unticking it should not leave a stale roster behind, in the same
+			# spirit as _clear_fields_from_other_layouts.
+			self.group_members = []
+			self.group_size = 0
+			return
+
+		members = self.group_members or []
+		if not members:
+			frappe.throw(
+				_("List the people arriving with {0}, or untick Group Visit.").format(
+					self.visitor_full_name or _("this visitor")
+				),
+				title=_("Group Visit Needs Members"),
+			)
+
+		seen = {}
+		seen_ids = {}
+		lead_id = _id_key(self.id_proof_number)
+		before_save = self.get_doc_before_save()
+		rows_before = {row.name: row for row in (before_save.get("group_members") if before_save else [])}
+		# Without an ID number a member is screened on name and mobile only, which
+		# blocks nobody on its own (VisitorBlacklist.find_active_match).
+		require_id = cint(self.docstatus) == 0 and vms_settings.require_group_member_id()
+		for row in members:
+			row.visitor_name = (row.visitor_name or "").strip()
+			if not row.visitor_name:
+				frappe.throw(
+					_("Row {0}: every accompanying visitor needs a name.").format(row.idx),
+					title=_("Missing Name"),
+				)
+			if require_id and not (row.id_proof_type and row.id_proof_number):
+				frappe.throw(
+					_(
+						"Row {0}: enter the ID Proof Type and ID Proof Number for {1}. "
+						"Every accompanying visitor is checked against the blacklist by ID."
+					).format(row.idx, row.visitor_name),
+					title=_("Missing ID Proof"),
+				)
+			self._validate_member_details(row, rows_before.get(row.name))
+			# One ID number is one person, whatever name is typed beside it.
+			member_id = _id_key(row.id_proof_number)
+			if member_id and member_id == lead_id:
+				frappe.throw(
+					_("Row {0}: {1} has the same ID proof number as the lead visitor.").format(
+						row.idx, row.visitor_name
+					),
+					title=_("Duplicate Group Member"),
+				)
+			if member_id and member_id in seen_ids:
+				frappe.throw(
+					_("Rows {0} and {1} have the same ID proof number.").format(seen_ids[member_id], row.idx),
+					title=_("Duplicate Group Member"),
+				)
+			if member_id:
+				seen_ids[member_id] = row.idx
+			# Two rows for the same person inflate the headcount the gate and
+			# catering both work from, so catch it here rather than at the door.
+			key = (row.visitor_name.lower(), (row.id_proof_number or "").strip().lower())
+			if key in seen:
+				frappe.throw(
+					_("Rows {0} and {1} are the same person ({2}).").format(
+						seen[key], row.idx, row.visitor_name
+					),
+					title=_("Duplicate Group Member"),
+				)
+			seen[key] = row.idx
+
+		self.group_size = 1 + len(members)
+		self._screen_group_members(members)
+
+	def _validate_member_details(self, row, before):
+		"""Hold an accompanying visitor's ID number and mobile to the lead visitor's rules.
+
+		Neither was checked at all, so a group row took "123" as an Aadhaar and
+		"abc" as a phone. Checked when a value is entered or changed (`before` is
+		the row as last saved, None for a new one), so a group saved before this
+		rule can still be approved and checked in.
+		"""
+
+		def changed(fieldname):
+			return before is None or (before.get(fieldname) or "") != (row.get(fieldname) or "")
+
+		if row.id_proof_number and (changed("id_proof_number") or changed("id_proof_type")):
+			if not row.id_proof_type:
+				frappe.throw(
+					_("Row {0}: choose the ID Proof Type for the ID number entered.").format(row.idx),
+					title=_("Missing ID Proof Type"),
+				)
+			if not validate_id(row.id_proof_type, row.id_proof_number):
+				frappe.throw(
+					_("Row {0}: {1}").format(row.idx, _(id_proof_error_message(row.id_proof_type))),
+					title=_("Invalid ID Proof"),
+				)
+			row.id_proof_number = normalise_id_number(row.id_proof_type, row.id_proof_number)
+
+		if row.mobile_number and changed("mobile_number"):
+			row.mobile_number = vms_phone.validate_mobile(
+				row.mobile_number, _("Row {0}: Mobile Number").format(row.idx)
+			)
+
+	def _screen_group_members(self, members):
+		"""Run the blacklist over every accompanying visitor."""
+		from finstein_visitor_management.visitor_management.doctype.visitor_blacklist.visitor_blacklist import (
+			VisitorBlacklist,
+		)
+
+		for row in members:
+			match = VisitorBlacklist.find_active_match(
+				id_proof_number=row.id_proof_number,
+				visitor_name=row.visitor_name,
+				id_proof_type=row.id_proof_type,
+				mobile_number=row.mobile_number,
+			)
+			drafting = (self.workflow_state or "Draft") in ("Draft", "Rejected")
+			if match and not self._blacklist_blocks():
+				self._allow_blacklisted(
+					frappe.get_doc("Visitor Blacklist", match), member=row, notify=not drafting
+				)
+				continue
+			if match:
+				entry = frappe.get_doc("Visitor Blacklist", match)
+				# Security hears of it when the visitor tried it themselves on the
+				# portal, or when the pass was on its way to an approver — the same
+				# two moments as for the lead visitor.
+				if frappe.session.user == "Guest" or not drafting:
+					self._alert_blacklist_match(entry, member=row)
+				self._refuse(
+					_(
+						"{0} (row {1}) is on the active blacklist ({2}, reason: {3}). "
+						"Remove them from the group before sending this pass for approval."
+					).format(row.visitor_name, row.idx, entry.name, entry.reason or _("Not specified")),
+					title=_("Access Denied — Blacklisted Group Member"),
+				)
+
+			weak = VisitorBlacklist.find_weak_match(
+				visitor_name=row.visitor_name, mobile_number=row.mobile_number
+			)
+			if weak:
+				entry = frappe.get_doc("Visitor Blacklist", weak["name"])
+				self._advise_staff(
+					_(
+						"{0} (row {1}) matches an active blacklist entry on {2} "
+						"({3}, reason: {4}), but not strongly enough to block automatically.<br>"
+						"<b>Verify their ID before allowing entry.</b>"
+					).format(
+						row.visitor_name,
+						row.idx,
+						_(weak["matched_on"]),
+						entry.name,
+						frappe.utils.escape_html(entry.reason or _("Not specified")),
+					),
+					title=_("Possible Blacklist Match — Verify ID"),
+				)
+
+	def _require_documents_to_leave_draft(self):
+		"""Photo and ID scan are needed to send a pass for approval, not to draft one.
+
+		Both fields used to be `reqd: 1`, which Frappe enforces on EVERY save —
+		so a receptionist could not save even a placeholder Draft for a walk-in
+		while someone fetched the camera or the ID scanner. A real front desk
+		enters a visitor in stages, often across two people. Reported as the
+		first thing a real lobby hits.
+
+		The requirement itself is not being dropped: it moves to the moment the
+		pass stops being a Draft. `mandatory_depends_on` on the fields gives the
+		red asterisk in the form, but it is not dependable on a workflow
+		transition (a pass could leave Draft with neither document), so
+		the actual enforcement is here. `before_submit()` still checks both
+		again at final approval.
+		"""
+		if self.workflow_state and self.workflow_state != "Draft":
+			missing = [
+				label
+				for field, label in (
+					("visitor_photo", _("Visitor Photo")),
+					("id_proof_scan", _("ID Proof Scan")),
+				)
+				if not self.get(field)
+			]
+			if missing:
+				message = _("{0} must be attached before this pass can be sent for approval.").format(
+					", ".join(missing)
+				)
+				link = self._invitation_link_for_documents()
+				if link:
+					message += "<br><br>" + link
+				frappe.throw(message, title=_("Missing Documents"))
+
+		# The visa copy and the item declaration were checked only by
+		# before_submit, i.e. at the final Approve: the pass sat in an approver's
+		# queue without them and the last approver was the one told. Asked for as
+		# the pass goes for approval, while it is still the requester's to fix.
+		if self.workflow_state not in pending_lanes():
+			return
+		if (
+			self.custom_nationality
+			and self.custom_nationality != _get_home_country()
+			and not self.custom_visa_copy
+		):
+			frappe.throw(
+				_(
+					"Attach the Visa Copy for this foreign national visitor before sending the pass for approval."
+				),
+				title=_("Missing Travel Documents"),
+			)
+		if (
+			vms_settings.flag("require_item_declaration")
+			and not self.visitor_items
+			and not (self.items_carried or "").strip()
+		):
+			frappe.throw(
+				_("List what the visitor is carrying under Items before sending this pass for approval."),
+				title=_("Items Not Declared"),
+			)
+
+	# What a new Visitor Invitation is prefilled with from the pass: (invitation field, pass field).
+	INVITATION_PREFILL = (
+		("visitor_type", "visitor_type"),
+		("visitor_email", "email_id"),
+		("visitor_full_name", "visitor_full_name"),
+		("visitor_mobile", "mobile_number"),
+		("host_employee", "person_to_visit"),
+		("visit_date", "visit_date"),
+		("expected_checkin", "expected_checkin"),
+		("expected_checkout", "expected_checkout"),
+		("purpose_of_visit", "purpose_of_visit"),
+	)
+
+	def _invitation_link_for_documents(self):
+		"""A link to invite the visitor to upload their own photo and ID, or "".
+
+		A host raising a pass rarely has the visitor's photo or ID scan. The
+		invitation link lets the visitor upload both themselves. Not offered for a
+		pass that came in through the portal or the gate (the visitor already had
+		their chance, or is standing there), or without an email to send it to.
+		"""
+		if self.request_channel in ("Portal", WALK_IN_CHANNEL) or not self.email_id:
+			return ""
+		if frappe.session.user == "Guest" or not frappe.has_permission("Visitor Invitation", "create"):
+			return ""
+		prefill = {key: self.get(fieldname) for key, fieldname in self.INVITATION_PREFILL}
+		route = "/desk/visitor-invitation/new?" + urlencode(
+			{key: str(value) for key, value in prefill.items() if value}
+		)
+		label = _("Send {0} an invitation to upload them").format(self.visitor_full_name or _("the visitor"))
+		return f'<a href="{frappe.utils.escape_html(route)}">{frappe.utils.escape_html(label)}</a>'
+
+	def _require_meal_type_to_send(self):
+		"""A meal asked for must say which meal by the time the pass goes for approval.
+
+		The meal is filled in from the visit's times (VMS Settings > Meal Windows).
+		A visit that covers no meal time, 14:00 to 16:30 say, got none, so the
+		Hospitality Manager was sent "Meal Required" with no meal and the kitchen
+		could not know what to make.
+		"""
+		if not self.flags.get("vms_sent_for_approval") or not cint(self.meal_required) or self.meal_type:
+			return
+		frappe.throw(
+			_(
+				"Meal Required is ticked but no Meal Type is chosen: the visit ({0} to {1}) does not "
+				"cover a meal time. Choose the meal on the Hospitality tab (Snacks for tea and "
+				"refreshments), or untick Meal Required."
+			).format(
+				get_time(self.expected_checkin).strftime("%H:%M") if self.expected_checkin else "-",
+				get_time(self.expected_checkout).strftime("%H:%M") if self.expected_checkout else "-",
+			),
+			title=_("Which Meal?"),
+		)
+
+	# Roles whose approval is itself the MD/CEO being told about the visit.
+	EXECUTIVE_APPROVER_ROLES = ("CEO",)
+
+	def _settle_executive_notification(self):
+		"""Settle "MD/CEO Notified" when the pass leaves Draft, not at final approval.
+
+		`before_submit()` demands the box for any Visitor Type with
+		`requires_executive_notification`, but submit is the LAST approval — so on
+		the VIP lane (HOD -> CEO) the host was never asked, the HOD approved, and
+		the CEO's own Approve was refused because nobody had ticked a box saying
+		the CEO had been told.
+
+		- If a CEO sits in this pass's approval chain, the CEO sees it in their
+		  queue: that is the notification, so the box is ticked for them.
+		- Otherwise the host must confirm it, and is told so at Submit — while
+		  the pass is still theirs to fix — instead of an approver later.
+		`before_submit()` keeps its check as the final safety net.
+		"""
+		# Only on the way into approval and at final approval — never on Reject.
+		if self.workflow_state not in pending_lanes() and self.docstatus != 1:
+			return
+		if cint(self.get("mdceo_notified")) or not self._visitor_type_flag("requires_executive_notification"):
+			return
+
+		chain = (
+			frappe.db.get_value(
+				"Visitor Type", self.visitor_type, ["approver_role", "secondary_approver_role"]
+			)
+			or ()
+		)
+		if any(role in self.EXECUTIVE_APPROVER_ROLES for role in chain):
+			self.mdceo_notified = 1
+		elif self.docstatus == 0:
+			frappe.throw(
+				_(
+					"Tick 'MD/CEO Notified' in the VIP Details section to confirm the MD/CEO "
+					"has been told about this visit, then send the pass for approval."
+				),
+				title=_("VIP Notification Required"),
+			)
+
+	def _validate_schedule(self):
+		"""Block past dates, enforce the future-date ceiling and a multi-day pass's validity.
+
+		A check-out at or before the check-in is the next day — a night shift
+		from 22:00 to 06:00 — so it is not refused here; _validate_visit_duration
+		measures it across midnight.
+		"""
+		# A multi-day pass with no end date was blocked only by the browser
+		# (visitor_pass.js's toggle_reqd), so anything that did not go through the
+		# form — an import, an integration, a portal submission — could store one.
+		# It fails shut rather than open: security_log.py needs BOTH multi_day_pass
+		# and pass_valid_until before it will allow re-entry, so such a pass simply
+		# behaves as single-day. That is the damage — a contractor is told they have
+		# a week's access and is turned away on day two, while the record still reads
+		# "multi-day" to whoever issued it. The sibling rule (a foreign national needs
+		# a visa copy) is already enforced server-side; this one now matches.
+		if getattr(self, "multi_day_pass", 0) and not self.pass_valid_until:
+			frappe.throw(
+				_("A multi-day pass needs a 'Pass Valid Until' date."),
+				title=_("Missing Pass Validity"),
+			)
+
+		if not self.visit_date:
+			return
+
+		today_date = getdate(today())
+		visit_date = getdate(self.visit_date)
+
+		# Past date blocked — allow only if the pass is already checked-in/out (historical edits OK)
+		if visit_date < today_date and self.status in (None, "", "Draft", "Approved"):
+			if not (self.docstatus == 1 and self.status in ("Checked-In", "Checked-Out", "Cancelled")):
+				frappe.throw(
+					_("Visit date {0} is in the past. Pick today or a future date.").format(self.visit_date),
+					title=_("Invalid Visit Date"),
+				)
+
+		# Future date ceiling — configurable in VMS Settings (0 disables it)
+		max_days = vms_settings.max_advance_booking_days()
+		if max_days and date_diff(visit_date, today_date) > max_days:
+			frappe.throw(
+				_("Visit date cannot be more than {0} days in the future.").format(max_days),
+				title=_("Invalid Visit Date"),
+			)
+
+		self._validate_pass_validity(visit_date)
+
+	def _validate_pass_validity(self, visit_date):
+		"""A multi-day pass runs from its visit date for at most the configured number of days.
+
+		Pass Valid Until was not checked at all: it could end before the visit
+		began, or a year after it, and the gate admits on every day in between.
+		Checked when the dates are set or changed, so a pass issued before this
+		rule still goes through approval and the gate.
+		"""
+		if not (cint(self.get("multi_day_pass")) and self.pass_valid_until):
+			return
+		if not self._changed_since_saved("visit_date", "pass_valid_until", "multi_day_pass"):
+			return
+		valid_until = getdate(self.pass_valid_until)
+		if valid_until < visit_date:
+			frappe.throw(
+				_("Pass Valid Until ({0}) cannot be before the Visit Date ({1}).").format(
+					formatdate(valid_until), formatdate(visit_date)
+				),
+				title=_("Invalid Pass Validity"),
+			)
+		longest = vms_settings.max_pass_validity_days()
+		if date_diff(valid_until, visit_date) > longest:
+			frappe.throw(
+				_("A multi-day pass can run at most {0} days. Set Pass Valid Until on or before {1}.").format(
+					longest, formatdate(add_days(visit_date, longest))
+				),
+				title=_("Invalid Pass Validity"),
+			)
+
+	def _validate_formats(self):
+		"""Validate email and ID proof number format per type."""
+		if self.email_id:
+			if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", self.email_id):
+				frappe.throw(
+					_("Email ID '{0}' is not a valid email address.").format(self.email_id),
+					title=_("Invalid Email"),
+				)
+
+		if self.id_proof_type and self.id_proof_number:
+			# A type switched off in the master is refused for a new number. One
+			# already on this pass, saved again as it was, is not: the pass still
+			# has to be approved, checked in and checked out.
+			unchanged = not self.is_new() and not (
+				self.has_value_changed("id_proof_number") or self.has_value_changed("id_proof_type")
+			)
+			if not validate_id(self.id_proof_type, self.id_proof_number, allow_deactivated=unchanged):
+				frappe.throw(
+					_(id_proof_error_message(self.id_proof_type)),
+					title=_("Invalid ID Proof"),
+				)
+			# validate_id() above only tested a normalised COPY of the number
+			# against the ID Proof Type master's regex — it never changed what
+			# gets saved. Re-assign the normalised form so the stored value is
+			# the one that actually passed validation; otherwise "lfc-1234"
+			# saves as typed even though the master says "Uppercase and strip
+			# spaces", and an exact-match lookup for "LFC-1234" (gate guard,
+			# report) never finds it. No-op for the four built-in types or an
+			# unknown type, which normalise_id_number() returns unchanged.
+			self.id_proof_number = normalise_id_number(self.id_proof_type, self.id_proof_number)
+
+		# Which documents a foreign national may present is a flag on the ID Proof
+		# Type master, not a hardcoded "Passport". A site can mark a foreign
+		# national ID / residence permit valid without a code change — and the
+		# old rule also forced foreign visitors onto the *Indian* passport
+		# pattern, which rejects most real foreign passport numbers.
+		if self.id_proof_type and self.custom_nationality and self.custom_nationality != _get_home_country():
+			if not is_valid_for_foreign_nationals(self.id_proof_type):
+				allowed = ", ".join(foreign_national_id_types()) or _("none configured")
+				frappe.throw(
+					_("Foreign national visitors must use one of: {0}.").format(allowed),
+					title=_("Invalid ID Proof Type"),
+				)
+
+	def _validate_host_active(self):
+		"""Host must be an Active employee."""
+		if not self.person_to_visit:
+			return
+		status = frappe.db.get_value("Employee", self.person_to_visit, "status")
+		if status != "Active":
+			# An employee's HR status is not the portal visitor's business (_refuse).
+			self._refuse(
+				_("Host {0} is not an Active employee (status: {1}). Cannot assign pass.").format(
+					self.person_to_visit, status or "Unknown"
+				),
+				title=_("Invalid Host"),
+			)
+
+	def _validate_duplicate_pass(self):
+		"""Same visitor (by ID proof) cannot hold two live passes for overlapping days.
+
+		A pass covers its visit date, or visit_date .. pass_valid_until for a
+		multi-day pass, so a contractor's week-long pass and a single-day pass on
+		its Wednesday clash although their visit dates differ. A single-day pass
+		whose visitor has checked out is finished: the same person coming back
+		for a second meeting that afternoon gets a new pass. ID numbers compare
+		without case, spaces, hyphens or slashes, as the blacklist does.
+
+		`FOR UPDATE` is what makes this hold under concurrency. Read-then-insert
+		is a time-of-check/time-of-use race: two portal submissions arriving
+		together both find nothing and both insert, so the rule this message
+		announces would not actually be true. Under REPEATABLE READ the locking
+		read takes a gap lock on the `id_proof_number` index range, so the second
+		transaction waits and then sees the first one's row. The lock is on the
+		number exactly as stored — narrow because `id_proof_number` is indexed;
+		without that InnoDB would escalate to locking the whole table on every
+		save. Numbers stored with other spacing are found by a plain read
+		after it.
+
+		Only when this save can change the answer (`_duplicate_check_can_change`):
+		submitting or approving a pass whose visitor, people and dates are as they
+		were re-ran the whole check at every step, once per accompanying visitor.
+		"""
+		if not self.visit_date or not self._duplicate_check_can_change():
+			return
+		self._validate_duplicate_members()
+		if not self.id_proof_number:
+			return
+		existing = (
+			self._live_pass_with_id(self.id_proof_number, lock=True)
+			or self._live_pass_with_id(self.id_proof_number)
+			# The same person listed as an accompanying visitor on another pass.
+			or self._pass_listing_member(self.id_proof_number)
+		)
+		if existing:
+			self._refuse_duplicate(
+				_(
+					"A visitor pass ({0}) already exists for this ID Proof on {1}. Duplicate passes are not allowed."
+				).format(existing[0][0], self._validity_text()),
+				existing[0][0],
+				self.visitor_full_name,
+			)
+
+	# What the duplicate-pass check reads off this pass.
+	DUPLICATE_CHECK_FIELDS = ("id_proof_key", "visit_date", "pass_valid_until", "multi_day_pass")
+
+	def _set_id_proof_keys(self):
+		"""Keep the stored match key of each ID number on the pass in step with the number.
+
+		The duplicate-pass check compares numbers without case or separators. Done in
+		SQL on the number itself (REPLACE(UPPER(...))) no index could serve it, so
+		every check read a year of passes - about 0.25 s, once for the lead visitor
+		and once more for each accompanying visitor, at every save, submit and
+		approval (49 s to take a 30-member group through, measured at 50k passes).
+		`id_proof_key` is the same comparison stored, and indexed. It sits at the
+		number's own permission level and is masked like it: it is the number.
+		"""
+		self.id_proof_key = _id_key(self.id_proof_number) or None
+		for row in self.get("group_members") or []:
+			row.id_proof_key = _id_key(row.id_proof_number) or None
+
+	def _duplicate_check_can_change(self):
+		"""Whether this save can change what the duplicate-pass check would answer.
+
+		Yes for a new pass, and when the ID number of the visitor or of anyone in the
+		group, the visit's dates or its multi-day setting changed. Also when the pass
+		comes back from a state the other passes' checks pass over (rejected,
+		cancelled, a single-day visit checked out): a clashing pass could have been
+		made meanwhile. Otherwise the answer is the one the last save got, because
+		every pass made or changed since ran the same check against this one.
+		"""
+		before = self.get_doc_before_save()
+		if self.is_new() or not before:
+			return True
+		if (
+			cint(before.docstatus) == 2
+			or before.status in ("Cancelled", "Rejected")
+			or (before.status == "Checked-Out" and not cint(before.multi_day_pass))
+		):
+			return True
+		if any(_as_text(before.get(f)) != _as_text(self.get(f)) for f in self.DUPLICATE_CHECK_FIELDS):
+			return True
+
+		def member_keys(doc):
+			return sorted(_id_key(row.id_proof_number) for row in doc.get("group_members") or [])
+
+		return member_keys(before) != member_keys(self)
+
+	def _validate_duplicate_members(self):
+		"""An accompanying visitor cannot already be on another live pass for these days.
+
+		The rule above looked at the lead visitor only, so the person it refused
+		as a second pass was accepted as a row on somebody else's group.
+		"""
+		for row in self.get("group_members") or []:
+			if not row.id_proof_number:
+				continue
+			other = self._live_pass_with_id(row.id_proof_number) or self._pass_listing_member(
+				row.id_proof_number
+			)
+			if other:
+				self._refuse_duplicate(
+					_(
+						"Row {0}: {1} is already on visitor pass {2} for {3}. Duplicate passes are not allowed."
+					).format(row.idx, row.visitor_name, other[0][0], self._validity_text()),
+					other[0][0],
+					row.visitor_name,
+				)
+
+	def _refuse_duplicate(self, message, other_pass, person):
+		"""Refuse a duplicate. A visitor on the portal is not told whose pass it clashes with.
+
+		The message names another visitor's pass and its dates, which an anonymous
+		guest has no business seeing. They get the neutral refusal (_refuse), and the
+		real reason is left for staff, outside the transaction the refusal rolls
+		back: on the invitation the visitor came in on, else on the other pass.
+		"""
+		if frappe.session.user == "Guest":
+			note = _(
+				"A pre-registration through the visitor portal was refused: {0} is already on "
+				"visitor pass {1} for {2}. The visitor was asked to contact their host."
+			).format(person or _("the visitor"), other_pass, self._validity_text())
+			reference = (
+				("Visitor Invitation", self.visitor_invitation)
+				if self.get("visitor_invitation")
+				else ("Visitor Pass", other_pass)
+			)
+			frappe.enqueue(
+				"finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.note_for_staff",
+				queue="short",
+				enqueue_after_commit=False,
+				reference_doctype=reference[0],
+				reference_name=reference[1],
+				note=note,
+			)
+		self._refuse(message, title=_("Duplicate Pass"))
+
+	# Another pass that is still good for a day this pass covers. `vp` is the
+	# other pass; it covers visit_date, or up to pass_valid_until when multi-day.
+	LIVE_OVERLAPPING_PASS = """
+		vp.name != %(self_name)s
+		AND vp.docstatus < 2
+		AND vp.status NOT IN ('Cancelled', 'Rejected')
+		AND NOT (vp.status = 'Checked-Out' AND IFNULL(vp.multi_day_pass, 0) = 0)
+		AND vp.visit_date BETWEEN %(earliest)s AND %(last_day)s
+		AND IF(IFNULL(vp.multi_day_pass, 0) = 1 AND vp.pass_valid_until IS NOT NULL,
+			vp.pass_valid_until, vp.visit_date) >= %(first_day)s
+	"""
+
+	def _overlap_params(self, id_proof_number):
+		first_day = getdate(self.visit_date)
+		last_day = first_day
+		if cint(self.get("multi_day_pass")) and self.pass_valid_until:
+			last_day = max(first_day, getdate(self.pass_valid_until))
+		return {
+			"id": id_proof_number,
+			"key": _id_key(id_proof_number),
+			"self_name": self.name or "NEW",
+			"first_day": first_day,
+			"last_day": last_day,
+			# Bounds the scan to the visit_date index. Not the current limit alone:
+			# a long pass approved before the limit was lowered still runs, so the
+			# window never shrinks below a year.
+			"earliest": add_days(first_day, -max(vms_settings.max_pass_validity_days(), 366)),
+		}
+
+	def _validity_text(self):
+		if cint(self.get("multi_day_pass")) and self.pass_valid_until:
+			return _("{0} to {1}").format(formatdate(self.visit_date), formatdate(self.pass_valid_until))
+		return formatdate(self.visit_date)
+
+	def _live_pass_with_id(self, id_proof_number, lock=False):
+		"""Another live pass for these days whose lead visitor has this ID number.
+
+		`lock` reads the number exactly as stored, through its index, FOR UPDATE.
+		Otherwise numbers are compared without case and separators, unlocked, on
+		the indexed `id_proof_key` (`_set_id_proof_keys`).
+		"""
+		match = "vp.id_proof_number = %(id)s" if lock else "vp.id_proof_key = %(key)s"
+		return frappe.db.sql(
+			f"""
+			SELECT vp.name FROM `tabVisitor Pass` vp
+			WHERE {match}
+			  AND {self.LIVE_OVERLAPPING_PASS}
+			LIMIT 1
+			{"FOR UPDATE" if lock else ""}
+			""",
+			self._overlap_params(id_proof_number),
+		)
+
+	def _pass_listing_member(self, id_proof_number):
+		"""Another live pass for these days with this ID among its accompanying visitors."""
+		return frappe.db.sql(
+			f"""
+			SELECT vp.name
+			FROM `tabVisitor Group Member` gm
+			INNER JOIN `tabVisitor Pass` vp ON vp.name = gm.parent
+			WHERE gm.parenttype = 'Visitor Pass'
+			  AND gm.id_proof_key = %(key)s
+			  AND {self.LIVE_OVERLAPPING_PASS}
+			LIMIT 1
+			""",
+			self._overlap_params(id_proof_number),
+		)
+
+	def _validate_visit_duration(self):
+		"""Enforce max visit duration from VMS Settings."""
+		if not (self.expected_checkin and self.expected_checkout):
+			return
+
+		if self._is_host_approved_invitation_schedule():
+			return
+
+		settings = frappe.get_cached_doc("VMS Settings")
+		max_hours = cint(getattr(settings, "max_visit_duration_hrs", 0))
+		if not max_hours:
+			return
+
+		duration_hours = _visit_minutes(self.expected_checkin, self.expected_checkout) / 60
+		if duration_hours > max_hours:
+			frappe.throw(
+				_(
+					"Visit duration ({0:.1f} hrs) exceeds the maximum allowed ({1} hrs). "
+					"A check-out time earlier than the check-in is read as the next day. "
+					"Adjust the expected check-in/out times."
+				).format(duration_hours, max_hours),
+				title=_("Visit Too Long"),
+			)
+
+	def _is_host_approved_invitation_schedule(self):
+		"""Allow invitation-backed passes to retain the host-approved visit window."""
+		if not self.visitor_invitation or not frappe.db.exists("Visitor Invitation", self.visitor_invitation):
+			return False
+
+		invitation = frappe.get_cached_doc("Visitor Invitation", self.visitor_invitation)
+		return (
+			str(self.visit_date or "") == str(invitation.visit_date or "")
+			and str(self.expected_checkin or "") == str(invitation.expected_checkin or "")
+			and str(self.expected_checkout or "") == str(invitation.expected_checkout or "")
+			and (self.person_to_visit or "") == (invitation.host_employee or "")
+		)
+
+	def _pending_lanes_for_type(self):
+		"""The pending lane(s) a pass of this visitor type may occupy, derived
+		from the type's approver_role (+ secondary_approver_role). Data-driven,
+		so custom Visitor Types route correctly without a hardcoded map."""
+		visitor_type_doc = _get_visitor_type_doc(self.visitor_type)
+		if not visitor_type_doc:
+			return ()
+		lanes = []
+		for role in (
+			getattr(visitor_type_doc, "approver_role", None),
+			getattr(visitor_type_doc, "secondary_approver_role", None),
+		):
+			if not role:
+				continue
+			lane = lane_for_role(role)
+			if lane not in lanes:
+				lanes.append(lane)
+		return tuple(lanes)
+
+	def _align_workflow_lane_with_visitor_type(self):
+		if not self.visitor_type or not self.workflow_state:
+			return
+
+		if self.workflow_state not in pending_lanes():
+			return
+
+		allowed_lanes = self._pending_lanes_for_type()
+		if not allowed_lanes:
+			return
+
+		if self.workflow_state in allowed_lanes:
+			return
+
+		self.workflow_state = allowed_lanes[0]
+
+	# ─────────────────────────────────────────────────────────
+	# APPROVERS, REJECTION, WITHDRAWAL
+	# ─────────────────────────────────────────────────────────
+	def _stored_state(self):
+		"""The workflow state the pass had before this save (None for a new pass)."""
+		before = None if self.is_new() else self.get_doc_before_save()
+		return before.get("workflow_state") if before else None
+
+	def _is_withdrawal(self):
+		"""Whether this save withdraws the pass, or touches one already withdrawn.
+
+		A withdrawn pass is final. Only a System Manager may still correct one.
+		"""
+		if self._stored_state() == WITHDRAWN:
+			if frappe.session.user != "Administrator" and "System Manager" not in frappe.get_roles():
+				frappe.throw(
+					_(
+						"This pass was withdrawn and can no longer be changed. Raise a new pass if the visit is back on."
+					),
+					title=_("Pass Withdrawn"),
+				)
+			return True
+		return self.workflow_state == WITHDRAWN
+
+	def _take_rejection_reason(self):
+		"""The reason belongs to the approver's decision, and a Reject needs one.
+
+		Unless VMS Settings > Optional Features makes the reason optional
+		(require_rejection_reason off).
+
+		Written only while the pass waits in a lane — by the approver, through
+		`reject_with_reason` — and held at its stored value at any other time.
+		A fresh request for approval starts without the last decision's reason.
+		"""
+		before_state = self._stored_state()
+		deciding = before_state in pending_lanes() and self.workflow_state in (before_state, REJECTED)
+		if not deciding:
+			before = None if self.is_new() else self.get_doc_before_save()
+			self.rejection_reason = before.get("rejection_reason") if before else None
+
+		if self.workflow_state == REJECTED and before_state in pending_lanes():
+			reason = strip_html(self.rejection_reason or "").strip()
+			# VMS Settings > Optional Features: the reason may be made optional.
+			if not reason and vms_settings.feature_on("require_rejection_reason"):
+				frappe.throw(
+					_("Give a reason for rejecting this pass. The host will see it."),
+					title=_("Reason Required"),
+				)
+			self.rejection_reason = reason or None
+		elif self.workflow_state in pending_lanes() and before_state not in pending_lanes():
+			self.rejection_reason = None
+
+	def _assert_decided_by_current_approver(self):
+		"""Approve and Reject come from someone who may decide this pass today.
+
+		The workflow conditions read `current_approvers` as stored, and the
+		stored list can trail reality — a stand-in whose delegation ended this
+		morning is still on it until the next refresh. So the decision itself is
+		judged on the live answer (approval_tasks.may_decide), as of the pass
+		before this save. A withdrawal is the requester's move and is not a decision.
+		"""
+		before_state = self._stored_state()
+		if before_state not in pending_lanes() or self.workflow_state in (before_state, WITHDRAWN):
+			return
+		if self.flags.get("ignore_approval_lane_check"):
+			return
+		before = self.get_doc_before_save()
+		user = frappe.session.user
+		if user != "Administrator" and user == before.get("submitted_for_approval_by"):
+			# Frappe's own self-approval rule knows only the owner. Someone holding
+			# both the requester's role and the approver's could send a pass they
+			# did not raise for approval, then decide it themselves.
+			frappe.throw(
+				_("You sent this pass for approval, so another approver has to decide it."),
+				frappe.PermissionError,
+				title=_("Another Approver Needed"),
+			)
+		if approval_tasks.may_decide(before):
+			return
+		frappe.throw(
+			_("This pass is waiting for someone else's approval, so you cannot approve or reject it."),
+			frappe.PermissionError,
+			title=_("Not Your Approval"),
+		)
+
+	def _route_approval(self):
+		"""Store who decides the pass's current step, and when it started waiting.
+
+		Recomputed on every save while the pass waits in a lane; cleared when it
+		goes back to Draft; kept once it is decided, as the record of who was asked
+		— they keep sight of the pass, not the right to act on it (permissions.py).
+		"""
+		state = self.workflow_state
+		if state in pending_lanes():
+			if state != self._stored_state():
+				self.pending_since = now_datetime()
+				self.approval_reminder_sent_on = None
+			resolved = approval_tasks.resolve_approvers(self)
+			self.routed_approver = resolved.routed
+			self.current_approvers = ",".join(resolved.named) or None
+			approval_tasks.grant_assigned_role(resolved.named)
+		elif state in (DRAFT, None, ""):
+			self.routed_approver = None
+			self.current_approvers = None
+			self.pending_since = None
+			self.approval_reminder_sent_on = None
+
+	# ─────────────────────────────────────────────────────────
+	# BEFORE SAVE
+	# ─────────────────────────────────────────────────────────
+	def before_save(self):
+		self._sync_items_carried()
+		self._normalize_mobile_number()
+		# Must follow _normalize_mobile_number: this mirrors the *stored* number,
+		# so deriving it any earlier would index a pre-normalisation value.
+		self.mobile_digits = _normalized_digits(self.mobile_number)
+		self._set_visitor_summary()
+		# Auto-fetch host department from Employee record
+		if self.person_to_visit and not self.host_department:
+			self.host_department = frappe.db.get_value("Employee", self.person_to_visit, "department")
+
+		# Badge colour comes from the linked Visitor Type master.
+		if self.visitor_type:
+			visitor_type_doc = _get_visitor_type_doc(self.visitor_type)
+			self.badge_colour = getattr(visitor_type_doc, "badge_colour", None) or "Orange"
+
+		# Sync item verification status from child table
+		if self.visitor_items:
+			total = len(self.visitor_items)
+			# Match fieldname from Visitor Item DocType
+			verified = sum(1 for i in self.visitor_items if i.verified_by_security)
+
+			if self.item_verification_status == "Discrepancy":
+				# Set by the gate when declared items did not go out with the
+				# visitor; a later save must not turn it back into a count.
+				pass
+			elif verified == 0:
+				self.item_verification_status = "Pending"
+			elif verified < total:
+				self.item_verification_status = "Partial"
+			else:
+				self.item_verification_status = "All Verified"
+				self.all_items_verified = 1
+
+	def _alert_blacklist_match(self, blacklist_doc, member=None, outcome=None):
+		"""Mail the Security Alert Roles about a blacklist match.
+
+		`member` is the accompanying visitor (a Visitor Group Member row) who
+		matched, when it was not the lead visitor. `outcome` says what happened
+		next; left out, it is the refusal of the pass that most callers go on to.
+		"""
+		recipients = self._security_alert_recipients()
+		if not recipients:
+			return
+		person = member or frappe._dict(
+			visitor_name=self.visitor_full_name,
+			id_proof_type=self.id_proof_type,
+			id_proof_number=self.id_proof_number,
+			mobile_number=self.mobile_number,
+		)
+		with_lead = f"<li><b>Arriving with:</b> {esc(self.visitor_full_name)}</li>" if member else ""
+		outcome = outcome or "Entry was blocked. No Visitor Pass created."
+		# Most callers frappe.throw right after this, which rolls the request back:
+		# a mail queued here (even `now=True`, which waits for a commit) was rolled
+		# back with it and the security team never heard. A background job is
+		# pushed outside the transaction, so the alert survives the refusal.
+		try:
+			send_in_background(
+				recipients=recipients,
+				subject=f"🚨 Blacklist match attempt: {person.visitor_name}",
+				message=(
+					f"<p><b>A blacklisted visitor attempted entry.</b></p>"
+					f"<ul>"
+					f"<li><b>Visitor:</b> {esc(person.visitor_name)}</li>"
+					f"{with_lead}"
+					f"<li><b>ID Proof:</b> {esc(person.id_proof_type)} — "
+					f"{esc(mask_id_number(person.id_proof_number or ''))}</li>"
+					f"<li><b>Mobile:</b> {esc(person.mobile_number, '-')}</li>"
+					f"<li><b>Reason on file:</b> {esc(blacklist_doc.reason)}</li>"
+					f"<li><b>Attempted host:</b> {esc(self.person_to_visit, '-')}</li>"
+					f"<li><b>Time:</b> {frappe.utils.now()}</li>"
+					f"</ul>"
+					f"<p>{esc(outcome)}</p>"
+				),
+				reference_doctype="Visitor Blacklist",
+				reference_name=blacklist_doc.name,
+			)
+		except Exception as exc:
+			frappe.log_error(f"Blacklist alert email failed: {exc}", "VMS Blacklist Alert")
+			# A failure here can leave a client message queued even though we
+			# catch the exception. Left alone,
+			# that stray message rides along with the very next frappe.throw
+			# this method's caller issues — the "Access Denied — Blacklisted
+			# Visitor" dialog — so the receptionist sees an unrelated "setup
+			# Email Account" line leaked inside a security refusal. Drop it,
+			# the same fix Visitor Invitation.send_invitation already applies
+			# to the identical failure mode.
+			frappe.clear_messages()
+
+	# Domains reserved for documentation (RFC 2606): no mailbox exists behind them.
+	# Frappe creates Administrator as admin@example.com and Guest as
+	# guest@example.com, and Administrator holds every role.
+	PLACEHOLDER_EMAIL_DOMAINS = ("example.com", "example.net", "example.org")
+
+	def _security_alert_recipients(self):
+		"""Who is mailed about a blacklist match.
+
+		Enabled users holding a Security Alert Role, plus VMS Settings → Admin
+		Email — so a site with no such user still hears about it. Only addresses
+		a mail can reach: this used to include users who had been disabled (a
+		guard who left kept receiving the alerts) and Administrator's placeholder
+		admin@example.com, which the check `email != "Administrator"` never
+		matched.
+		"""
+		user_names = frappe.get_all(
+			"Has Role",
+			filters={
+				"role": ["in", vms_settings.security_alert_roles()],
+				"parenttype": "User",
+			},
+			pluck="parent",
+			distinct=True,
+		)
+		emails = []
+		if user_names:
+			# Single bulk query for all emails instead of one get_value() per user
+			# (avoids an N+1 round-trip per security/admin user on every alert).
+			emails = frappe.get_all(
+				"User",
+				filters={"name": ["in", user_names], "enabled": 1},
+				pluck="email",
+			)
+
+		recipients = {}
+		for email in (*emails, vms_settings.admin_email()):
+			# "" for anything that is not an e-mail address (a User can be named
+			# without one).
+			address = validate_email_address(email or "")
+			if not address or "," in address:
+				continue
+			if address.rsplit("@", 1)[-1].lower() in self.PLACEHOLDER_EMAIL_DOMAINS:
+				continue
+			# One mail per mailbox, however the address is capitalised.
+			recipients.setdefault(address.lower(), address)
+
+		return sorted(recipients.values())
+
+	def _normalize_mobile_number(self):
+		if not self.mobile_number:
+			return
+		raw = str(self.mobile_number).strip()
+
+		if self.custom_nationality and self.custom_nationality != _get_home_country():
+			# Foreign national — the number already carries its own country's
+			# ISD prefix from the Phone widget; don't force Indian formatting.
+			return
+
+		digits = "".join(c for c in raw if c.isdigit())
+		if not digits:
+			return
+		# Frappe Phone widget expects "+{isd}-{number}" format (hyphen, NOT space)
+		# See apps/frappe/frappe/public/js/frappe/form/controls/phone.js:167
+		isd = vms_settings.country_code()
+		if raw.startswith("+") and not raw.startswith(f"+{isd}"):
+			# Another country's number, already carrying its own code and stored as
+			# validate() checked it. Forcing the home prefix onto its last ten
+			# digits turned a home national's foreign SIM into a number that
+			# reaches nobody.
+			return
+		if digits.startswith(isd) and len(digits) > 10:
+			digits = digits[len(isd) :]
+		self.mobile_number = f"+{isd}-{digits[-10:]}" if len(digits) >= 10 else raw
+
+	def _set_visitor_summary(self):
+		mobile_display = (self.mobile_number or "").replace("-", " ")
+		parts = [self.visitor_full_name or "", mobile_display]
+		self.visitor_summary = " | ".join(p for p in parts if p)
+
+	def _sync_items_carried(self):
+		"""Bi-directional sync between `items_carried` (Small Text shown on the
+		desk form) and the structured `visitor_items` child table.
+
+		Rules — in priority order:
+		  1. If `visitor_items` already has rows AND items_carried matches the
+		     auto-summary of those rows → data is already consistent, leave
+		     everything alone. This is the path the portal uses when it sets
+		     both fields atomically with structured rows + a derived summary.
+		  2. If items_carried is set and visitor_items is empty → create a
+		     single mirror row (keeps gate verification working for
+		     desk-form users who only type free-text).
+		  3. If items_carried is set but visitor_items rows DON'T match the
+		     summary → the desk-form user just edited items_carried; rebuild
+		     the structured rows from the new text (single row mirror,
+		     preserving prior verification state).
+		  4. If items_carried is empty and rows exist → derive a summary into
+		     items_carried so prints / dropdowns have a single label.
+		"""
+		text = (self.items_carried or "").strip()
+		rows = list(self.visitor_items or [])
+		auto_summary = self._summarise_items(rows)
+
+		if rows and text and text == auto_summary:
+			# Already consistent; don't rebuild anything.
+			return
+
+		if text:
+			parsed = self._parse_items_carried(text)
+			if not parsed:
+				return
+
+			current = [((r.item_name or "").strip(), int(r.quantity or 1)) for r in rows]
+			wanted = [(p["item_name"], p["quantity"]) for p in parsed]
+			if current == wanted:
+				return
+
+			# Keep whatever the gate already confirmed, matched by item name, so
+			# editing the text does not silently un-verify an item an officer
+			# has already checked.
+			previous = {(r.item_name or "").strip().casefold(): r for r in rows}
+
+			self.set("visitor_items", [])
+			for item in parsed:
+				row = self.append(
+					"visitor_items",
+					{
+						"item_name": item["item_name"],
+						"quantity": item["quantity"],
+					},
+				)
+				prior = previous.get(item["item_name"].casefold())
+				if prior is not None:
+					if prior.verified_by_security:
+						row.verified_by_security = 1
+					if prior.verification_remarks:
+						row.verification_remarks = prior.verification_remarks
+					# Carry over everything the free text cannot express. Only
+					# name and quantity are recoverable from items_carried, so
+					# without this an edit to the text silently blanked the
+					# category, UOM, serial and value the row already had. A row
+					# marked "Weapon" came back blank, and the Select then
+					# rendered pre-selected on its first option and saved that.
+					for field in (
+						"item_code",
+						"item_category",
+						"unit_of_measure",
+						"serial_number",
+						"description",
+						"estimated_value",
+					):
+						value = prior.get(field)
+						if value not in (None, ""):
+							row.set(field, value)
+
+			# Write the normalised summary back so the next save sees itself as
+			# already in sync; otherwise "Lap,mobile" and "Lap, mobile" differ
+			# forever and every save rebuilds the rows.
+			self.items_carried = self._summarise_items(self.visitor_items)
+		elif rows:
+			# items_carried empty but rows exist (portal flow) → derive summary
+			self.items_carried = auto_summary
+
+	@staticmethod
+	def _parse_items_carried(text):
+		"""Split the free-text list into one entry per item.
+
+		A visitor typing "Lap, mobile" means two things, not one. Storing the
+		whole string as a single row gave the gate officer one checklist line
+		covering two physical items — so a laptop and a phone could not be
+		verified, or found missing, independently. It also read back to the
+		visitor as "Lap,mobile (Qty: 1.0)" in the approval mail.
+
+		Understands the "(xN)" suffix `_summarise_items` writes, so parsing this
+		function's own output round-trips to the same rows and repeated saves
+		stay stable.
+		"""
+		items = []
+		for chunk in re.split(r"[,\n;]+", text or ""):
+			name = chunk.strip()
+			if not name:
+				continue
+
+			quantity = 1
+			match = re.search(r"\(\s*x\s*(\d+)\s*\)\s*$", name, re.IGNORECASE)
+			if match:
+				quantity = int(match.group(1)) or 1
+				name = name[: match.start()].strip()
+
+			# The text is cleaned in validate (GUEST_TEXT_FIELDS); a name is never
+			# stored with markup whichever way this is reached.
+			if "<" in name:
+				name = strip_html(name).strip()
+
+			if name:
+				items.append({"item_name": name, "quantity": quantity})
+		return items
+
+	@staticmethod
+	def _summarise_items(rows):
+		"""Build the same comma-separated summary string the portal helper
+		creates, so the controller can detect 'already-in-sync' state."""
+		if not rows:
+			return None
+		parts = []
+		for r in rows:
+			name = (r.item_name or "").strip()
+			if not name:
+				continue
+			qty = r.quantity
+			if qty and int(qty or 0) > 1:
+				name = f"{name} (x{int(qty)})"
+			parts.append(name)
+		return ", ".join(parts) if parts else None
+
+	def copy_attachments_from_amended_from(self):
+		"""Copy the amended pass's attachments without a false refusal.
+
+		Frappe's own copy inserts a File row per attachment, and each insert
+		re-checks access against the newest File row for that URL — for a
+		visitor who went through the gate, a Security Log the approver cannot
+		read. The Sales Manager amending a cancelled pass was refused ("You do not
+		have permission to access this file") although they can read that pass
+		and every file on it. Anyone who can read the pass being amended gets the
+		rows copied directly (uploads.copy_file_row); anyone else, Frappe's own
+		behaviour and its check.
+		"""
+		if not frappe.has_permission("Visitor Pass", "read", self.amended_from):
+			return super().copy_attachments_from_amended_from()
+		from frappe.desk.form.load import get_attachments
+
+		for item in get_attachments(self.doctype, self.amended_from):
+			copy_file_row(item.name, self)
+
+	def on_update(self):
+		adopt_stray_uploads(self)
+		share_files_from_source_pass(self)
+		self._record_portal_blacklist_match()
+		if self.docstatus == 0 and self.status == "Draft":
+			return
+		if self.workflow_state == WITHDRAWN:
+			# The visit is off, so its meal request and room booking are too —
+			# once, on the way in.
+			if self._stored_state() != WITHDRAWN:
+				call_off_pass_arrangements(self)
+			return
+		ensure_hospitality_request(self)
+
+	# The hospitality fields that stay editable on an approved pass (allow_on_submit).
+	HOSPITALITY_FIELDS = (
+		"meal_required",
+		"meal_type",
+		"number_of_people",
+		"special_diet",
+		"refreshments_required",
+		"conference_room",
+		"hospitality_notes",
+	)
+
+	def on_update_after_submit(self):
+		"""An approved pass whose meal or room changes takes its arrangements with it.
+
+		These fields stay editable after approval, but only on_update synced the
+		Hospitality Request and room booking, and it does not run for a submitted
+		document: the kitchen kept cooking for two after the host changed it to
+		six, and a room taken off the pass stayed booked.
+		"""
+		if self._changed_since_saved(*self.HOSPITALITY_FIELDS):
+			ensure_hospitality_request(self)
+
+	def save_version(self):
+		"""Keep the change history, with every ID number in it masked.
+
+		Version stores the old and new value of each changed field as plain text,
+		and the timeline returns it to anyone who can open the pass — so a host
+		who may only ever see the last four characters read the whole number
+		under "changed value of ID Proof Number (Full)". Group members' numbers
+		went the same way, through added, removed and changed rows.
+
+		The QR token is set at approval and must not reach the timeline either,
+		which any reader of the pass sees; nor the ID match key, which is the
+		number itself (group members' keys are masked with their numbers). See
+		id_numbers.save_masked_version.
+		"""
+		save_masked_version(self, drop_fields=("qr_token", "id_proof_key"))
+
+	def run_notifications(self, method):
+		"""Keep a failing alert email from eating this save's real messages.
+
+		The Notification records this app ships (VMS PRR Submitted, VMS Pass
+		Rejected, ...) send through frappe.sendmail. On a site with no outgoing
+		Email Account — every fresh install, and any site with a transient mail
+		problem — that raises via frappe.throw, which queues a message carrying
+		`raise_exception: 1`. The Desk renders that one and drops the plain
+		messages queued earlier in the same response.
+
+		The casualty is the blacklist warning: a visitor matching an entry on
+		name alone is deliberately not blocked, only flagged for a human to
+		check the ID. The warning was in the response, yet the approver saw
+		only "Please setup default outgoing
+		Email Account", so a name-flagged visitor sailed through with no
+		indication. A security prompt must not be one unrelated mail failure
+		away from vanishing.
+
+		So the queue is snapshotted and restored around the notification run,
+		the same shape as security_log.py's `_advance_pass`. Anything the
+		notifications queued is dropped (they have nothing to say to the user
+		on the happy path); everything this save had already told the user
+		survives. The underlying failure is still recorded in Error Log by
+		core, so nothing is hidden from an administrator.
+		"""
+		messages_before = list(frappe.message_log)
+		try:
+			super().run_notifications(method)
+		finally:
+			frappe.local.message_log = messages_before
+
+	# ─────────────────────────────────────────────────────────
+	# BEFORE SUBMIT
+	# ─────────────────────────────────────────────────────────
+	def _assert_reached_via_approval(self):
+		"""A submit is only legitimate as the tail of an Approve transition.
+
+		`Approved` is the workflow's only `doc_status = 1` state, and Frappe's
+		`set_workflow_state_on_action` force-sets the state that matches the new
+		docstatus whenever a document is submitted directly — so a bare
+		`frappe.client.submit` lands on `Approved` without any transition ever
+		being evaluated.
+
+		Checking only that the stored state was some pending lane was not enough:
+		on a two-level type the first approver could submit straight from their
+		own lane, skipping the second, and the transition's conditions (the
+		approver is not the visit's host) and allow_self_approval = 0 were never
+		looked at. So the workflow is asked what it would allow: from the pass as
+		stored, for the user submitting, there must be a transition to the
+		Approved state whose condition holds and which this user may take.
+		"""
+		if self.flags.get("ignore_approval_lane_check"):
+			return
+
+		# A site with no Visitor Type configured has no lanes at all; blocking
+		# every submit there would be worse than the risk it guards against.
+		if not pending_lanes():
+			return
+
+		from frappe.model.workflow import (
+			get_transitions,
+			get_workflow,
+			get_workflow_name,
+			has_approval_access,
+		)
+
+		previous_state = frappe.db.get_value("Visitor Pass", self.name, "workflow_state")
+		if previous_state in pending_lanes():
+			if not get_workflow_name(self.doctype):
+				return  # the workflow was switched off: nothing to ask
+			# The stored pass, not this one: its fields are what was sent for approval.
+			stored = frappe.get_doc("Visitor Pass", self.name)
+			workflow = get_workflow(self.doctype)
+			final_states = {state.state for state in workflow.states if cint(state.doc_status) == 1}
+			user = frappe.session.user
+			if approval_tasks.may_decide(stored, user) and any(
+				transition.next_state in final_states and has_approval_access(user, stored, transition)
+				for transition in get_transitions(stored, workflow)
+			):
+				return
+			frappe.throw(
+				_(
+					"This pass is waiting in <b>{0}</b> and you cannot give it final approval. "
+					"Use the workflow Actions button — a pass you raised or are hosting, or one "
+					"that still needs another approver, is approved by someone else."
+				).format(_(previous_state)),
+				title=_("Approval Required"),
+			)
+
+		frappe.throw(
+			_(
+				"This pass is in <b>{0}</b> and has not been through approval. "
+				"Use the workflow Actions button — a pass cannot be submitted directly."
+			).format(previous_state or _("an unknown state")),
+			title=_("Approval Required"),
+		)
+
+	def before_submit(self):
+		# 0️⃣ THE APPROVAL MUST HAVE BEEN EARNED
+		self._assert_reached_via_approval()
+
+		# 0️⃣.1 REQUIRED DOCUMENTS
+		if not self.visitor_photo:
+			frappe.throw(
+				_("Visitor Photo is required before submitting the pass."),
+				title=_("Missing Visitor Photo"),
+			)
+		if not self.id_proof_scan:
+			frappe.throw(
+				_("ID Proof Scan is required before submitting the pass."),
+				title=_("Missing ID Proof Scan"),
+			)
+
+		# 0️⃣.5 OPTIONAL ITEM DECLARATION (enforced via VMS Settings)
+		settings = frappe.get_cached_doc("VMS Settings")
+		if settings.get("require_item_declaration") and not self.visitor_items:
+			frappe.throw(
+				_("Item declaration is required — add at least one item row before submitting."),
+				title=_("Items Not Declared"),
+			)
+
+		# 1️⃣ BLACKLIST CHECK
+		# Strong match only: exact ID proof number, or name+mobile corroborating
+		# each other on the same entry (see VisitorBlacklist.find_active_match's
+		# docstring for why name-alone/mobile-alone are not trusted to block).
+		from finstein_visitor_management.visitor_management.doctype.visitor_blacklist.visitor_blacklist import (
+			VisitorBlacklist,
+		)
+
+		blacklist_name = VisitorBlacklist.find_active_match(
+			id_proof_number=self.id_proof_number,
+			visitor_name=self.visitor_full_name,
+			id_proof_type=self.id_proof_type,
+			mobile_number=self.mobile_number,
+		)
+
+		if blacklist_name and not self._blacklist_blocks():
+			# Let through by VMS Settings; validate() has already warned and
+			# recorded it (_validate_not_blacklisted).
+			pass
+		elif blacklist_name:
+			bl = frappe.get_doc("Visitor Blacklist", blacklist_name)
+			self._alert_blacklist_match(bl)
+			frappe.throw(
+				msg=_(
+					"Visitor: {0}\n"
+					"Reason: {1}\n\n"
+					"This person is on the active blacklist. The pass cannot be submitted."
+				).format(self.visitor_full_name, bl.reason or _("Not specified")),
+				title=_("Access Denied — Blacklisted Visitor"),
+			)
+		else:
+			# Weak, single-field hit — warn instead of silently doing nothing.
+			self._warn_weak_blacklist_match()
+
+		# 3️⃣ Executive notification — driven by the Visitor Type flag, not a name
+		if self._visitor_type_flag("requires_executive_notification"):
+			if not getattr(self, "mdceo_notified", 0):
+				frappe.throw(
+					_(
+						"MD/CEO must be notified before submitting a VIP Visitor Pass. "
+						"Please check the MD/CEO Notified field in the VIP Details section."
+					),
+					title=_("VIP Notification Required"),
+				)
+
+		# 4️⃣ Foreign National Document Check
+		home_country = _get_home_country()
+		if self.custom_nationality and self.custom_nationality != home_country:
+			if not self.custom_visa_copy:
+				frappe.throw(
+					_("Visa Copy is required for foreign national visitors."),
+					title=_("Missing Travel Documents"),
+				)
+
+	# ─────────────────────────────────────────────────────────
+	# CANCEL
+	# ─────────────────────────────────────────────────────────
+	def before_cancel(self):
+		# on_cancel calls off the pass's meal request and room booking; one that
+		# is history (a served meal, an earlier day's booking) stays submitted
+		# and still links here, and Frappe would refuse the cancel over it
+		# (check_no_back_links_exist runs right after on_cancel).
+		self.ignore_linked_doctypes = ("Hospitality Request", "Conference Room Booking")
+
+		# The gate records an exit only for a Checked-In pass. Cancelling one
+		# while the visitor is still inside would leave them with no way out
+		# on record — check them out first.
+		if self.status == "Checked-In":
+			frappe.throw(
+				_(
+					"{0} is still inside. Check the visitor out at the gate before cancelling the pass."
+				).format(self.visitor_full_name or self.name),
+				title=_("Visitor On Site"),
+			)
+
+		# A visit that took place stays on record. Cancelling a checked-out pass
+		# rewrote its status to "Cancelled", and it then dropped out of the guard's
+		# Daily Visitor Log and every count of who had been on site that day.
+		if self.status == "Checked-Out" or self.actual_checkin:
+			frappe.throw(
+				_(
+					"{0} has already visited on this pass, so it cannot be cancelled. "
+					"A visit that took place stays on record."
+				).format(self.visitor_full_name or self.name),
+				title=_("Visit Already Took Place"),
+			)
+
+	def on_cancel(self):
+		# Frappe's cancel runs before_cancel/on_cancel but not validate, so
+		# _sync_status_with_workflow never saw it: a cancelled pass kept reading
+		# "Approved" (or "Checked-Out") — in lists, filters, reports, and to the
+		# gate buttons that key on `status`.
+		self.db_set("status", "Cancelled")
+		# The visit is off, so its meal request and room booking are too.
+		call_off_pass_arrangements(self)
+
+	# ─────────────────────────────────────────────────────────
+	# ON SUBMIT
+	# ─────────────────────────────────────────────────────────
+	def on_submit(self):
+		# Record approval details
+		self.db_set("approval_date", now_datetime())
+		self.db_set("approved_by", frappe.session.user)
+		self.db_set("status", "Approved")
+
+		# Mint the badge now unless this Visitor Type issues it at the gate
+		# (handled in security_log.py during check-in).
+		if not self._visitor_type_flag("issue_badge_at_gate"):
+			self.generate_badge_number(update_status=False)
+
+		# The QR's secret part: without it a code naming the pass, the visitor and
+		# the date — all printed on the badge — could be made by anyone. Kept off
+		# the form and out of reports (permlevel 2, which no role holds).
+		if not self.qr_token:
+			self.db_set("qr_token", secrets.token_urlsafe(16), update_modified=False)
+
+		# Generate QR Code for the badge
+		qr_file_url, qr_content = self._generate_qr_code()
+
+		# Notify the visitor via email, and the food dept if a meal was requested.
+		# Both are courtesy mails: an approval that cannot be emailed is still a
+		# valid approval, so neither may block the submit or shout at the approver.
+		# frappe.sendmail on a site with no outgoing Email Account raises through
+		# frappe.throw, which queues a red "Please setup default outgoing Email
+		# Account" message for the client — reported live on Approve. Snapshot and
+		# restore around both, so a mail problem is logged for the administrator
+		# and invisible to the approver, without discarding anything this save had
+		# already told them. Same shape as run_notifications() above.
+		messages_before = list(frappe.message_log)
+		try:
+			self._send_approval_email(qr_file_url, qr_content)
+		except Exception as exc:
+			frappe.log_error(f"Approval email failed for {self.name}: {exc}", "VMS Approval Email")
+		finally:
+			frappe.local.message_log = messages_before
+
+		if getattr(self, "meal_required", 0):
+			messages_before = list(frappe.message_log)
+			try:
+				self._notify_food_dept()
+			finally:
+				frappe.local.message_log = messages_before
+
+	# ─────────────────────────────────────────────────────────
+	# GENERATE BADGE NUMBER (Called by Security Log)
+	# ─────────────────────────────────────────────────────────
+	def generate_badge_number(self, update_status=True):
+		"""Generate a badge number if enabled in VMS Settings.
+
+		`update_status=True` means this was called from the items-verification flow
+		(Security Log) — move the pass to "Items Verified".
+		`update_status=False` means called from on_submit — keep status as "Approved".
+
+		The items-verification path may only run against a pass the workflow
+		actually approved. The Security Log's own checks say so too; repeating it
+		here is deliberate defence in depth, because the `db_set` below writes
+		`status` straight past validation, and any future caller would otherwise
+		inherit the same hole. on_submit is unaffected — it passes
+		`update_status=False`, and it is itself what moves the document to
+		docstatus 1.
+		"""
+		if self.badge_number:
+			return
+
+		if update_status and not (cint(self.docstatus) == 1 and self.workflow_state in APPROVED_STATES):
+			frappe.throw(
+				_("Visitor Pass {0} is not approved (currently {1}), so no badge can be issued.").format(
+					self.name, self.workflow_state or _("Draft")
+				),
+				frappe.PermissionError,
+			)
+
+		# Check VMS Settings — is badge enabled for this visitor type?
+		settings = frappe.get_cached_doc("VMS Settings")
+		if not getattr(settings, "enable_badge", 1):
+			return
+
+		# Whether this type gets a physical badge is a flag on the Visitor Type.
+		# (The legacy `badge_required_for` free-text list used a substring match, so
+		# a type named "VI" wrongly matched "VIP". It is still honoured when the
+		# type predates the flag, but split into exact lines.)
+		visitor_type_doc = _get_visitor_type_doc(self.visitor_type)
+		if visitor_type_doc is not None:
+			if not cint(getattr(visitor_type_doc, "requires_badge", 1)):
+				return
+		else:
+			legacy = (getattr(settings, "badge_required_for", "") or "").strip()
+			if legacy and self.visitor_type not in [t.strip() for t in legacy.splitlines() if t.strip()]:
+				return
+
+		p = getattr(visitor_type_doc, "badge_prefix", None) or "VIS"
+
+		# Count and stamp against this pass's own visit date — a future-dated pass
+		# must not be numbered against today's sequence. The current pass is already
+		# persisted by the time a badge is minted, so exclude it: counting it made
+		# the first badge of the day come out as -0002.
+		visit_date = str(self.visit_date or today())
+		date_str = visit_date.replace("-", "")
+
+		# A badge number is a physical access identifier: two visitors holding the
+		# same one is a safety problem, not a cosmetic one. Counting rows and
+		# adding 1 is a read-then-write race — two passes approved in the same
+		# moment both counted the same total and both minted the same number
+		# (this site already contains such a pair). `get_series_next` is Frappe's
+		# atomic counter: it increments in the database under a row lock, so each
+		# caller gets a distinct value.
+		prefix = f"{p}-{date_str}-"
+		badge_no = f"{prefix}{getseries(prefix, 4)}"
+
+		self.db_set("badge_number", badge_no)
+		# "Items Verified" is the step between approval and the gate. A pass that
+		# has already moved on (Checked-In, Checked-Out) must never be pulled back
+		# to it: a gate log opened for a visitor with no badge yet (badges switched
+		# on after approval) minted one here and knocked a visitor who was inside
+		# back to "Items Verified" — and check-out then refused them.
+		current = frappe.db.get_value("Visitor Pass", self.name, "status")
+		if update_status and current == "Approved":
+			self.db_set("status", "Items Verified")
+
+		frappe.msgprint(
+			_("Badge Number Generated: {0}").format(badge_no),
+			alert=True,
+			indicator="green",
+		)
+
+	# ─────────────────────────────────────────────────────────
+	# PRIVATE: GENERATE QR CODE
+	# ─────────────────────────────────────────────────────────
+	def _generate_qr_code(self):
+		# Match keys used in visitor_gate.py (scan_qr_checkin), which identifies
+		# the pass by PASS and checks TOKEN against qr_token. We deliberately do
+		# NOT embed the ID proof number or host in the QR: the QR image is emailed
+		# and could be intercepted/leaked, and the gate re-derives those values
+		# from the DB.
+		qr_data = (
+			f"PASS:{self.name}|TOKEN:{self.qr_token}"
+			f"|VISITOR:{self.visitor_full_name}|VISIT_DATE:{self.visit_date}"
+		)
+
+		qr_img = qrcode.make(qr_data)
+		buffer = BytesIO()
+		qr_img.save(buffer, format="PNG")
+		qr_content = buffer.getvalue()
+
+		# Cleanup existing QR files for this record
+		frappe.db.delete(
+			"File",
+			{
+				"attached_to_doctype": "Visitor Pass",
+				"attached_to_name": self.name,
+				"attached_to_field": "qr_code_image",
+			},
+		)
+
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"QR_{self.name}.png",
+				"attached_to_doctype": "Visitor Pass",
+				"attached_to_name": self.name,
+				"attached_to_field": "qr_code_image",
+				"content": qr_content,
+				# Private: the QR is attached to the pass (staff with read access can
+				# still view it) but is no longer world-readable in /files. It is
+				# emailed to the visitor as an attachment, so this does not break delivery.
+				"is_private": 1,
+			}
+		)
+
+		file_doc.insert(ignore_permissions=True)
+		self.db_set("qr_code_image", file_doc.file_url)
+		return file_doc.file_url, qr_content
+
+	# ─────────────────────────────────────────────────────────
+	# PRIVATE: SEND EMAIL
+	# ─────────────────────────────────────────────────────────
+	def _send_approval_email(self, qr_file_url, qr_content=None):
+		if not self.email_id:
+			return
+
+		items_section = ""
+		if self.visitor_items:
+			items_section = (
+				"<h3 style='margin: 16px 0 6px; font-size: 14px;'>Items Declared</h3>"
+				"<ul style='margin: 0 0 12px 20px; padding: 0;'>"
+			)
+			for item in self.visitor_items:
+				qty = getattr(item, "quantity", 1)
+				items_section += f"<li>{esc(item.item_name)} (Qty: {esc(qty)})</li>"
+			items_section += "</ul>"
+
+		time_value = ""
+		if self.expected_checkin and self.expected_checkout:
+			time_value = f"{esc(self.expected_checkin)} &ndash; {esc(self.expected_checkout)}"
+
+		td_label = "padding: 8px; border: 1px solid #ddd; width: 30%;"
+		td_value = "padding: 8px; border: 1px solid #ddd;"
+
+		# Values are escaped here, as they are collected: every one of them is
+		# record data except `time_value`, which carries its own entity.
+		details_rows = [
+			("Date", esc(self.visit_date)),
+			("Time", time_value),
+			# The visitor reading this has no idea what "HR-EMP-00001" means, and
+			# it leaks an internal identifier outside the organisation. Show who
+			# they are actually meeting, and how to reach them.
+			("Host", esc(self._host_display())),
+			("Purpose", esc(self.purpose_of_visit)),
+			("Pass ID", esc(self.name)),
+		]
+		# Where to go is the single most useful thing a visitor needs on arrival,
+		# and the site already configured it per Visitor Type.
+		arrival_gate = self._arrival_gate()
+		if arrival_gate:
+			details_rows.insert(2, ("Entry Gate", esc(arrival_gate)))
+		details_html = "<table style='border-collapse: collapse; width: 100%; margin: 0 0 12px 0;'>"
+		for i, (label, value) in enumerate(details_rows):
+			bg = "background: #f4f5f7;" if i % 2 == 0 else ""
+			details_html += (
+				f"<tr style='{bg}'>"
+				f"<td style='{td_label}'><b>{label}</b></td>"
+				f"<td style='{td_value}'>{value}</td>"
+				f"</tr>"
+			)
+		details_html += "</table>"
+
+		contractor_li = ""
+		if (self.visitor_type_layout or "") == "Contractor":
+			contractor_li = (
+				"<li>Ensure you have completed the required safety induction and are "
+				"wearing provided PPE.</li>"
+			)
+
+		attachments = []
+		if qr_content:
+			attachments.append({"fname": f"QR_{self.name}.png", "fcontent": qr_content})
+
+		self._send_approval_mail(details_html, items_section, contractor_li, attachments)
+
+	def _arrival_gate(self):
+		"""The gate this visitor should actually report to.
+
+		Every Visitor Type names its own entry point — a VIP is met at the
+		executive lobby, a contractor at the goods entrance — and the gate
+		officer's Security Log already auto-assigns from this same field. So the
+		site has already decided where each visitor goes; telling them all to
+		find "the security gate" throws that away and sends a VIP to the wrong
+		door.
+		"""
+		if not self.visitor_type:
+			return None
+		return frappe.db.get_value("Visitor Type", self.visitor_type, "default_gate") or None
+
+	def _host_display(self):
+		"""The host as a person: name, and email when we have one.
+
+		`person_to_visit` stores an Employee ID. It is the correct value to keep
+		on the record, but it is the wrong thing to print in a message — a
+		visitor cannot act on "HR-EMP-00001", and it exposes an internal
+		identifier to an external recipient.
+
+		Falls back through name, then email, then the ID, so the row is never
+		blank on an Employee with incomplete data.
+		"""
+		name = (self.host_name or "").strip()
+		email = (self.host_email or "").strip()
+
+		if not name and self.person_to_visit:
+			name = frappe.db.get_value("Employee", self.person_to_visit, "employee_name") or ""
+
+		if name and email:
+			return f"{name} ({email})"
+		return name or email or (self.person_to_visit or "")
+
+	def _send_approval_mail(self, details_html, items_section, contractor_li, attachments):
+		"""Deliver the visitor's approval mail.
+
+		Wrapped so a missing/misconfigured Email Account cannot block the
+		approval itself — without this, `on_submit` raises "Please setup default
+		outgoing Email Account" and the whole workflow transition rolls back, so
+		no pass can ever be approved on a site that has not configured SMTP yet.
+		Matches how the food-dept and host-arrival notifications already behave.
+		"""
+		try:
+			self._deliver_approval_mail(details_html, items_section, contractor_li, attachments)
+		except Exception as exc:
+			frappe.log_error(f"Approval email failed for {self.name}: {exc}", "VMS Approval Email")
+
+	def _deliver_approval_mail(self, details_html, items_section, contractor_li, attachments):
+		# Name the gate the visitor is actually expected at. Falls back to the
+		# generic wording only when a Visitor Type has no default gate set, so a
+		# half-configured site still gets a sensible sentence.
+		arrival_gate = esc(self._arrival_gate())
+		gate_phrase = f"<b>{arrival_gate}</b>" if arrival_gate else "the security gate"
+		badge_phrase = (
+			f"at the security desk at <b>{arrival_gate}</b>" if arrival_gate else "at the security desk"
+		)
+
+		frappe.sendmail(
+			recipients=[self.email_id],
+			# Without a reference, frappe.sendmail leaves no Communication behind,
+			# so an approval that really was emailed shows nothing in the pass's
+			# Activity timeline and there is no record of what went to whom. The
+			# send itself worked; it was simply unauditable after the fact.
+			reference_doctype=self.doctype,
+			reference_name=self.name,
+			subject=f"Visit Approved: {self.visit_date} — Pass {self.name}",
+			message=(
+				f"<div style='font-family: Arial, sans-serif; font-size: 14px; color: #1f2933; line-height: 1.5;'>"
+				f"<p>Dear <b>{esc(self.visitor_full_name)}</b>,</p>"
+				f"<p>Your visit has been <b style='color: #28a745;'>APPROVED</b>.</p>"
+				f"<h3 style='margin: 16px 0 6px; font-size: 14px;'>Visit Details</h3>"
+				f"{details_html}"
+				f"{items_section}"
+				f"<h3 style='margin: 16px 0 6px; font-size: 14px;'>On Arrival</h3>"
+				f"<ul style='margin: 0 0 12px 20px; padding: 0;'>"
+				f"<li>Please carry a valid photo ID matching the one you registered with.</li>"
+				f"<li>Scan the <b>QR code attached to this email</b> at {gate_phrase}.</li>"
+				f"<li>Your physical badge will be issued {badge_phrase} after item verification.</li>"
+				f"{contractor_li}"
+				f"</ul>"
+				f"<p>We look forward to welcoming you.</p>"
+				f"<p style='margin-top: 20px; color: #64748b; font-size: 12px;'>"
+				f"This is an automated email. Please contact your host for any changes or queries."
+				f"</p>"
+				f"</div>"
+			),
+			attachments=attachments,
+		)
+
+	# ─────────────────────────────────────────────────────────
+	# PRIVATE: NOTIFY FOOD DEPT
+	# ─────────────────────────────────────────────────────────
+	def _notify_food_dept(self):
+		"""Tell the kitchen what they actually need to serve this visitor.
+
+		This used to send only "Meal Type: Lunch / Visitor Pass: VP-…", which
+		does not let anyone prepare anything: no headcount, no service time, and
+		— the reason this matters — no allergies. `dietary_allergies` is a
+		visible, editable field on the Hospitality Request, so a host can record
+		"severe nut allergy" in good faith and it would reach nobody. A form that
+		asks and then discards the answer is worse than one that never asked.
+		"""
+		food_email = frappe.db.get_single_value("VMS Settings", "food_dept_email")
+		if not food_email:
+			return
+
+		allergies = accessibility = None
+		if self.hospitality_request:
+			allergies, accessibility = frappe.db.get_value(
+				"Hospitality Request",
+				self.hospitality_request,
+				["dietary_allergies", "accessibility_requirements"],
+			) or (None, None)
+
+		rows = [
+			("Visitor", self.visitor_full_name),
+			("Visit Date", self.visit_date),
+			("Meal", self.meal_type),
+			("Serving Slots", self.assigned_meal_slots),
+			("Service Time", self.service_time),
+			("Number of People", self.number_of_people or 1),
+			("Dietary Preference", self.special_diet),
+			("Allergies", allergies),
+			("Accessibility", accessibility),
+			("Notes", self.hospitality_notes),
+			("Visitor Pass", self.name),
+		]
+		body = "".join(
+			# Allergies are the one line a cook must not miss, so it is called out
+			# rather than left to blend into the table.
+			# nosemgrep: string-concat-in-list - one string split over lines on purpose, not a missing comma
+			f"<tr><td style='padding:6px 10px;border:1px solid #ddd;'><b>{label}</b></td>"
+			f"<td style='padding:6px 10px;border:1px solid #ddd;"
+			f"{'color:#b42318;font-weight:bold;' if label == 'Allergies' and value else ''}'>"
+			f"{esc(value)}</td></tr>"
+			for label, value in rows
+			if value not in (None, "")
+		)
+
+		try:
+			frappe.sendmail(
+				recipients=[food_email],
+				reference_doctype=self.doctype,
+				reference_name=self.name,
+				subject=f"Meal Required: {self.visitor_full_name} — {self.visit_date}",
+				message=(
+					"<div style='font-family:Arial,sans-serif;font-size:13px;color:#1f2933;"
+					"background-color:#ffffff;padding:16px;border-radius:6px;'>"
+					"<h3 style='margin:0 0 10px;color:#102a43;'>Meal Request for Visitor</h3>"
+					"<table style='border-collapse:collapse;width:100%;'>"
+					f"{body}"
+					"</table></div>"
+				),
+			)
+		except Exception as exc:
+			frappe.log_error(
+				f"Food dept notification failed for {self.name}: {exc}", "VMS Food Dept Notification"
+			)
+
+
+def _normalized_digits(value):
+	return "".join(ch for ch in (value or "") if ch.isdigit())
+
+
+def _visit_minutes(checkin, checkout):
+	"""Minutes from expected check-in to check-out; a check-out at or before the
+	check-in is the next day (22:00 to 06:00 is 8 hours)."""
+	ci, co = get_time(checkin), get_time(checkout)
+	minutes = (co.hour * 60 + co.minute) - (ci.hour * 60 + ci.minute)
+	return minutes if minutes > 0 else minutes + 24 * 60
+
+
+def _as_text(value):
+	"""A field value as compared between a save and the stored pass."""
+	return "" if value is None else str(value).strip()
+
+
+def _id_key(value):
+	"""An ID number as compared within one pass and between passes (stored as
+	`id_proof_key`): case and separators do not make a new person.
+
+	setup._backfill_id_proof_keys applies the same rule in SQL to rows saved before
+	the column existed; change the two together.
+	"""
+	return re.sub(r"[\s\-/]", "", (value or "").upper())
+
+
+@frappe.whitelist(methods=["POST"])
+def reject_with_reason(name: str, reason: str | None = None):
+	"""Reject a pass waiting for approval, with the reason the host will be shown.
+
+	The Desk's Reject asks for the reason first and comes here. One request, so
+	a Reject that is refused (by someone who may not decide this pass, say)
+	leaves no reason behind on the pass. `apply_workflow` reads the pass back
+	from the database, which is why the reason is written there first.
+	"""
+	from frappe.model.workflow import apply_workflow
+
+	reason = strip_html(reason or "").strip()
+	if not reason and vms_settings.feature_on("require_rejection_reason"):
+		frappe.throw(
+			_("Give a reason for rejecting this pass. The host will see it."), title=_("Reason Required")
+		)
+	doc = frappe.get_doc("Visitor Pass", name)
+	doc.check_permission("write")
+	if doc.docstatus != 0 or doc.workflow_state not in pending_lanes():
+		frappe.throw(_("This pass is no longer waiting for approval."), title=_("Already Decided"))
+	frappe.db.set_value("Visitor Pass", name, "rejection_reason", reason or None, update_modified=False)
+	return apply_workflow(doc.as_dict(), ACTION_REJECT).as_dict()
+
+
+@frappe.whitelist()
+def get_existing_visitor_matches(
+	visitor_type: str | None = None,
+	id_proof_number: str | None = None,
+	mobile_number: str | None = None,
+	exclude_name: str | None = None,
+):
+	id_proof_number = (id_proof_number or "").strip()
+	mobile_number = (mobile_number or "").strip()
+	exclude_name = (exclude_name or "").strip()
+	visitor_type = (visitor_type or "").strip()
+
+	if not id_proof_number and not mobile_number:
+		return {"best_match": None, "matches": []}
+
+	# Authorisation: require doctype read, then constrain rows to the caller's
+	# Visitor Pass permission scope so this cannot enumerate other visitors' PII.
+	frappe.has_permission("Visitor Pass", "read", throw=True)
+	from finstein_visitor_management.permissions import get_visitor_pass_permission_query_conditions
+
+	_perm = get_visitor_pass_permission_query_conditions()
+	perm_filter = f" AND ({_perm})" if _perm else ""
+
+	matches = []
+	seen = set()
+
+	def _push(rows):
+		for row in rows:
+			if row.name in seen:
+				continue
+			seen.add(row.name)
+			matches.append(row)
+
+	type_filter = "AND visitor_type = %(visitor_type)s" if visitor_type else ""
+	exclude_filter = "AND name != %(exclude_name)s" if exclude_name else ""
+	params = {
+		"visitor_type": visitor_type,
+		"exclude_name": exclude_name,
+		"id_proof_number": id_proof_number,
+	}
+
+	if id_proof_number:
+		by_id = frappe.db.sql(
+			"""
+            SELECT name, visitor_full_name, visitor_type, mobile_number, id_proof_number
+            FROM `tabVisitor Pass`
+            WHERE id_proof_number = %(id_proof_number)s
+            """
+			+ type_filter
+			+ exclude_filter
+			+ perm_filter
+			+ """
+            ORDER BY modified DESC
+            LIMIT 10
+            """,
+			params,
+			as_dict=True,
+		)
+		_push(by_id)
+
+	if mobile_number and len(matches) < 10:
+		phone_digits = _normalized_digits(mobile_number)
+		# Match on the stored digit form in SQL rather than fetching rows and
+		# comparing in Python.
+		#
+		# This query used to select any pass with a non-empty mobile_number,
+		# `ORDER BY modified DESC LIMIT 100`, and compare digits afterwards. It
+		# had no phone predicate at all, so it only ever examined the 100
+		# most-recently-touched passes on the site: past roughly that many rows
+		# the duplicate check stopped finding anyone who last visited more than
+		# a few hours ago, and returned "no match" — a silent wrong answer at
+		# the gate rather than a visible failure. `mobile_digits` is maintained
+		# in before_save and indexed, so the match is now both complete and a
+		# single indexed lookup.
+		if phone_digits:
+			by_phone = frappe.db.sql(
+				"""
+                SELECT name, visitor_full_name, visitor_type, mobile_number, id_proof_number
+                FROM `tabVisitor Pass`
+                WHERE mobile_digits = %(phone_digits)s
+                """
+				+ type_filter
+				+ exclude_filter
+				+ perm_filter
+				+ """
+                ORDER BY modified DESC
+                LIMIT 10
+                """,
+				{
+					"visitor_type": visitor_type,
+					"exclude_name": exclude_name,
+					"phone_digits": phone_digits,
+				},
+				as_dict=True,
+			)
+
+			# Pushed one at a time to keep the original cap: `_push` dedupes
+			# against `seen` but does not bound the list.
+			for row in by_phone:
+				_push([row])
+				if len(matches) >= 10:
+					break
+
+	# Raw SQL is not masked by Frappe: only the last four go back to the browser.
+	for row in matches:
+		row.id_proof_number = shown_id(row.id_proof_number)
+	return {"best_match": matches[0] if matches else None, "matches": matches}
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def search_visitor_passes(
+	doctype: str,
+	txt: str | None,
+	searchfield: str | None,
+	start: int | str,
+	page_len: int | str,
+	filters: dict | str | None,
+):
+	frappe.has_permission("Visitor Pass", "read", throw=True)
+	filters = filters or {}
+	visitor_type = filters.get("visitor_type")
+
+	conditions = []
+	params = []
+	if visitor_type:
+		conditions.append("visitor_type = %s")
+		params.append(visitor_type)
+	if txt:
+		like = f"%{txt}%"
+		conditions.append(
+			"(name LIKE %s OR visitor_full_name LIKE %s OR mobile_number LIKE %s OR email_id LIKE %s OR visitor_summary LIKE %s)"
+		)
+		params.extend([like] * 5)
+
+	where = " AND ".join(conditions) if conditions else "1=1"
+	# Constrain rows to the caller's Visitor Pass permission scope.
+	from finstein_visitor_management.permissions import get_visitor_pass_permission_query_conditions
+
+	_perm = get_visitor_pass_permission_query_conditions()
+	if _perm:
+		where += f" AND ({_perm})"
+	# Compute the dropdown description live (visitor_full_name · mobile_number) so
+	# reception can spot + search by phone, regardless of how stale the cached
+	# `visitor_summary` is on legacy/demo records.
+	# Compute the dropdown description live (visitor_full_name · mobile_number) so reception
+	# can spot + search by phone, regardless of how stale the cached visitor_summary is.
+
+	return frappe.db.sql(
+		"""SELECT
+                name,
+                CONCAT_WS(' · ', NULLIF(visitor_full_name, ''), NULLIF(mobile_number, '')) AS description
+            FROM `tabVisitor Pass`
+            WHERE """
+		+ where
+		+ """
+            ORDER BY modified DESC
+            LIMIT %s OFFSET %s""",
+		[*params, int(page_len), int(start)],
+	)
+
+
+EXISTING_PASS_VISIT_FIELDS = ("multi_day_pass", "pass_valid_until", "followup_date")
+
+
+@frappe.whitelist()
+def get_existing_visitor_pass_details(visitor_pass: str | None, visitor_type: str | None = None):
+	if not visitor_pass:
+		frappe.throw(_("Visitor Pass is required."))
+
+	doc = frappe.get_doc("Visitor Pass", visitor_pass)
+	# IDOR guard: this returns ID proof number/scan + photo. Enforce the app's
+	# own row-level access model (the same model used by the search endpoints and
+	# list views) so a user cannot fetch a pass outside their scope. We use the
+	# app's hook rather than doc.check_permission() so this stays consistent with
+	# the search results and is not skewed by deployment-specific User Permissions.
+	from finstein_visitor_management.permissions import has_visitor_pass_permission
+
+	if frappe.session.user != "Administrator" and not has_visitor_pass_permission(
+		doc, frappe.session.user, "read"
+	):
+		raise frappe.PermissionError("You are not permitted to access this Visitor Pass.")
+	if visitor_type and doc.visitor_type != visitor_type:
+		frappe.throw(_("Selected record type does not match current Visitor Type."))
+
+	common_fields = [
+		"name",
+		"visitor_type",
+		"visitor_type_layout",
+		"visitor_full_name",
+		"mobile_number",
+		"email_id",
+		"company__organisation",
+		"id_proof_type",
+		"id_proof_number",
+		"id_proof_scan",
+		"visitor_photo",
+	]
+
+	# Who the visitor is carries over; the visit does not. The old pass's date,
+	# times, host and purpose used to replace what reception had just typed for
+	# this visit — and its validity ended before the new visit began.
+	fields = common_fields + [
+		f for f in LAYOUT_FIELDS.get(doc.visitor_type_layout or "", []) if f not in EXISTING_PASS_VISIT_FIELDS
+	]
+	details = {field: doc.get(field) for field in fields}
+	# get_doc is not masked by Frappe. The form copies the masked value and names
+	# this pass as id_proof_source; the real number is copied over on save.
+	details["id_proof_number"] = shown_id(doc.id_proof_number)
+	details["id_proof_masked"] = doc.id_proof_masked
+	return details
+
+
+# What a Customer pass copies from the CRM record picked on it: pass field -> the
+# record's fields, first one with a value. "owner" is the record's owning User.
+CRM_REFERENCE_FIELDS = {
+	"Lead": {
+		"visitor_full_name": ("lead_name",),
+		"mobile_number": ("mobile_no",),
+		"email_id": ("email_id",),
+		"company__organisation": ("company_name",),
+		"owner": ("lead_owner",),
+	},
+	"Opportunity": {
+		"visitor_full_name": ("contact_display", "customer_name"),
+		"mobile_number": ("contact_mobile",),
+		"email_id": ("contact_email",),
+		"company__organisation": ("customer_name",),
+		"owner": ("opportunity_owner",),
+	},
+	"Customer": {
+		"visitor_full_name": ("customer_name",),
+		"mobile_number": ("mobile_no",),
+		"email_id": ("email_id",),
+		"company__organisation": ("customer_name",),
+		"owner": ("account_manager",),
+	},
+}
+
+
+@frappe.whitelist()
+def get_crm_reference_details(reference_type: str, reference_name: str | None = None) -> dict:
+	"""The visitor details a Customer pass takes from a Lead, Opportunity or Customer.
+
+	The form read the whole CRM record with frappe.client.get and wrote the
+	record's owner — a User — into Sales Executive, which links to Employee, so
+	the pass could not be saved. This returns the five values only, with the
+	owner resolved to their Employee (blank when they have none).
+
+	Nothing is granted on the CRM DocTypes: the caller must be able to read the
+	record picked, exactly as the link picker requires.
+	"""
+	mapping = CRM_REFERENCE_FIELDS.get(reference_type)
+	if not mapping:
+		frappe.throw(
+			_("{0} cannot be used as a CRM reference.").format(reference_type), frappe.PermissionError
+		)
+	if not reference_name or not frappe.db.exists(reference_type, reference_name):
+		return {}
+	frappe.has_permission(reference_type, "read", doc=reference_name, throw=True)
+
+	meta = frappe.get_meta(reference_type)
+	sources = sorted({f for fields in mapping.values() for f in fields if meta.has_field(f)})
+	record = frappe.db.get_value(reference_type, reference_name, sources, as_dict=True) or {}
+	details = {
+		target: next((record.get(f) for f in fields if record.get(f)), None)
+		for target, fields in mapping.items()
+	}
+
+	owner = details.pop("owner")
+	employee = (
+		frappe.db.get_value("Employee", {"user_id": owner, "status": "Active"}, "name") if owner else None
+	)
+	details["sales_executive"] = employee
+	# For the form's note that Sales Executive could not be filled in.
+	details["owner_without_employee"] = owner if owner and not employee else None
+	return details
+
+
+@frappe.whitelist()
+def get_meal_plan_preview(
+	visit_date: str | None = None,
+	expected_checkin: str | None = None,
+	expected_checkout: str | None = None,
+) -> dict | None:
+	"""The meals a visit's times would qualify for, for the desk form.
+
+	The form used the portal's guest endpoint (lifecycle.get_hospitality_meal_plan),
+	which is limited to 60 calls an hour per IP address — and an office shares
+	one. A front desk raising passes ran into "rate limit exceeded" on a date
+	change. This one is for logged-in staff who can read passes and has no limit.
+	"""
+	frappe.has_permission("Visitor Pass", "read", throw=True)
+	messages_before = list(frappe.message_log)
+	try:
+		window = frappe._dict(
+			visit_date=getdate(visit_date) if visit_date else None,
+			expected_checkin=get_time(expected_checkin) if expected_checkin else None,
+			expected_checkout=get_time(expected_checkout) if expected_checkout else None,
+		)
+	except Exception:
+		# A half-typed date or time: nothing to preview yet, and nothing to say
+		# about it (the date parser queues its own message as it raises).
+		frappe.local.message_log = messages_before
+		return None
+	return derive_hospitality_meal_plan(window)
+
+
+@frappe.whitelist()
+def check_mobile_number(mobile_number: str | None = None) -> dict:
+	"""How a pass would store this mobile number, or why it would be refused.
+
+	For the hint under the form's Mobile Number: the same rule validate() applies
+	(phone.validate_mobile), so the form no longer says a number "looks good"
+	that the save then turns down.
+	"""
+	frappe.has_permission("Visitor Pass", "read", throw=True)
+	messages_before = list(frappe.message_log)
+	try:
+		return {"valid": 1, "saved_as": vms_phone.validate_mobile(mobile_number)}
+	except frappe.ValidationError as exc:
+		return {"valid": 0, "message": strip_html(str(exc))}
+	finally:
+		# validate_mobile raises through frappe.throw, which also queues the
+		# message for a dialog; here it is only wanted as the hint's text.
+		frappe.local.message_log = messages_before

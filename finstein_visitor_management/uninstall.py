@@ -1,0 +1,311 @@
+"""Leave the site as it was before this app, when the app is removed.
+
+`bench uninstall-app` deletes what is tagged with this app's modules — its
+DocTypes and their rows, workspaces, reports, charts, number cards, the web form
+and module-tagged notifications. Everything else this app put on the site
+stayed behind:
+
+  - `allow_guests_to_upload_files`, switched on site-wide for the visitor portal;
+  - the Job Applicant interview fields (customisations carry no module);
+  - the three workflows and two untagged notifications, pointing at DocTypes
+    that no longer exist;
+  - the roles it created;
+  - the permission rows earlier versions wrote on Employee, Supplier, Job
+    Applicant, Maintenance Visit and Page;
+  - visitors' ID scans, photos and visa copies: the File rows and the bytes on
+    disk, orphaned once their passes were dropped — personal documents with no
+    record left to govern who may read them;
+  - assignments, pending workflow actions, comments, versions, emails and
+    share/permission rows pointing at records that no longer exist;
+  - its scheduled jobs (until the next migrate) and its one-time setup markers.
+
+`before_uninstall` removes all of that. Anything the site may own too (a role or
+permission row that existed before this app) is left alone.
+"""
+
+import inspect
+
+import frappe
+
+from finstein_visitor_management.setup import (
+	_CREATED_MARKER,
+	_PORTAL_UPLOADS_SELF_ENABLED_MARKER,
+	_shared_records,
+	release_legacy_core_grants,
+)
+
+APP_MODULES = ("Visitor Management", "Conference Room")
+WORKFLOWS = ("Visitor Pass Approval", "Hospitality Request Approval", "Conference Room Booking Approval")
+
+# Rows elsewhere that point at a record of one of this app's DocTypes.
+REFERENCING_ROWS = (
+	("File", "attached_to_doctype"),
+	("ToDo", "reference_type"),
+	("Workflow Action", "reference_doctype"),
+	("Comment", "reference_doctype"),
+	("Version", "ref_doctype"),
+	("Communication", "reference_doctype"),
+	("Notification Log", "document_type"),
+	("DocShare", "share_doctype"),
+	("User Permission", "allow"),
+	("Custom DocPerm", "parent"),
+	("Property Setter", "doc_type"),
+	("Email Queue", "reference_doctype"),
+)
+
+
+def before_uninstall():
+	if _is_dry_run():
+		# `uninstall-app --dry-run` still calls this hook (frappe/installer.py
+		# remove_app runs before_uninstall before it looks at dry_run), so a
+		# rehearsal used to switch guest uploads off for the whole site.
+		print("  Visitor Management: dry run — nothing on the site is changed by this app's uninstall hook.")
+		return
+
+	app_doctypes = frappe.get_all("DocType", filters={"module": ("in", APP_MODULES)}, pluck="name")
+
+	_revert_portal_uploads_setting()
+	_remove_customisations()
+	# Permission rows earlier versions wrote on Employee, Supplier, Job Applicant,
+	# Maintenance Visit and Page — only the ones this app could have written.
+	release_legacy_core_grants(force=True)
+	_remove_workflows_and_alerts(app_doctypes)
+	_remove_referencing_rows(app_doctypes)
+	_remove_created_shared_records(app_doctypes)
+	_remove_scheduled_jobs()
+	_forget_setup_markers()
+
+
+def _is_dry_run():
+	for frame_info in inspect.stack():
+		if (
+			frame_info.function == "remove_app"
+			and frame_info.frame.f_globals.get("__name__") == "frappe.installer"
+		):
+			return bool(frame_info.frame.f_locals.get("dry_run"))
+	return False
+
+
+def _revert_portal_uploads_setting():
+	"""Turn `allow_guests_to_upload_files` back off — but only when this app is
+	the one that turned it on, and only when it is still on now.
+
+	`setup._PORTAL_UPLOADS_SELF_ENABLED_MARKER` is set in exactly the branch of
+	`_allow_portal_uploads()` that performs the flip. A site whose setting was
+	already on (or that ran a version from before the marker existed) is left as
+	it is, and the administrator is told why — reverting unconditionally could
+	break guest uploads another app relies on.
+	"""
+	if not frappe.db.get_default(_PORTAL_UPLOADS_SELF_ENABLED_MARKER):
+		print(
+			"  Visitor Management: allow_guests_to_upload_files was left as-is. This "
+			"install has no record of having switched it on itself (it may already "
+			"have been on before this app was installed, for another app or by an "
+			"administrator's own choice), so it is not safe to assume this app owns "
+			"turning it back off. Review System Settings -> Allow Guests to Upload "
+			"Files by hand if it should be disabled now."
+		)
+		return
+
+	currently_enabled = frappe.db.get_single_value("System Settings", "allow_guests_to_upload_files")
+	if not currently_enabled:
+		return
+
+	frappe.db.set_single_value("System Settings", "allow_guests_to_upload_files", 0)
+	print(
+		"  Visitor Management: turned allow_guests_to_upload_files back off "
+		"(this install had switched it on for the visitor portal)."
+	)
+
+
+def _shipped_custom_fields():
+	"""(dt, fieldname) for every Custom Field in visitor_management/custom/*.json."""
+	import glob
+	import json
+	import os
+
+	fields = []
+	for path in glob.glob(
+		os.path.join(frappe.get_app_path("finstein_visitor_management"), "*", "custom", "*.json")
+	):
+		# nosemgrep: frappe-security-file-traversal - paths are the app's own custom/*.json files
+		with open(path) as f:
+			spec = json.load(f)
+		for field in spec.get("custom_fields", []):
+			fields.append((field.get("dt") or spec.get("doctype"), field["fieldname"]))
+	return fields
+
+
+def _remove_customisations():
+	for dt, fieldname in _shipped_custom_fields():
+		name = frappe.db.get_value("Custom Field", {"dt": dt, "fieldname": fieldname}, "name")
+		if name:
+			# The column and any values in it stay, as with every Custom Field
+			# Frappe deletes; the field is no longer part of the form.
+			frappe.delete_doc("Custom Field", name, ignore_permissions=True, force=True)
+			print(f"  removed Custom Field {name}")
+
+
+def _remove_workflows_and_alerts(app_doctypes):
+	for name in WORKFLOWS:
+		if frappe.db.exists("Workflow", name):
+			frappe.delete_doc("Workflow", name, ignore_permissions=True, force=True)
+			print(f"  removed Workflow {name}")
+	if app_doctypes:
+		for name in frappe.get_all(
+			"Notification", filters={"document_type": ("in", app_doctypes)}, pluck="name"
+		):
+			# ignore_on_trash, as Frappe's own module cleanup does: Notification.on_trash
+			# refuses to delete a standard one, and would touch the app's files.
+			frappe.delete_doc("Notification", name, ignore_permissions=True, force=True, ignore_on_trash=True)
+
+
+def _remove_referencing_rows(app_doctypes):
+	if not app_doctypes:
+		return
+	for doctype, fieldname in REFERENCING_ROWS:
+		if not frappe.db.table_exists(doctype):
+			continue
+		names = frappe.get_all(doctype, filters={fieldname: ("in", app_doctypes)}, pluck="name")
+		if not names:
+			continue
+		if doctype == "File":
+			# Through the document, so the bytes on disk go too (File.on_trash
+			# keeps them only while another File row still points at them).
+			for name in names:
+				try:
+					frappe.delete_doc(
+						"File", name, ignore_permissions=True, force=True, delete_permanently=True
+					)
+				except Exception:
+					frappe.log_error(title=f"VMS uninstall: could not delete File {name}")
+		else:
+			for table in frappe.get_meta(doctype).get_table_fields():
+				frappe.db.delete(table.options, {"parent": ("in", names), "parenttype": doctype})
+			frappe.db.delete(doctype, {fieldname: ("in", app_doctypes)})
+		print(f"  removed {len(names)} {doctype} row(s) of this app's records")
+
+
+def _created_by_app(doctype, name):
+	return bool(frappe.db.get_default(_CREATED_MARKER.format(doctype=doctype, name=name)))
+
+
+def _remove_created_shared_records(app_doctypes):
+	"""Roles, workflow states and actions this app created — and nothing it found.
+
+	"HOD", "CEO", "Security", "Draft", "Approved" are names other apps and sites
+	use too, so only a record this app recorded creating is a candidate, and even
+	then only while nothing outside this app still uses it. A site installed by a
+	version that did not record this keeps them all.
+	"""
+	for role in _shared_records()["Role"]:
+		if not (frappe.db.exists("Role", role) and _created_by_app("Role", role)):
+			continue
+		used_by = _role_used_elsewhere(role, app_doctypes)
+		if used_by:
+			print(f"  kept Role {role}: {used_by} still uses it")
+			continue
+		frappe.db.delete("Has Role", {"role": role})
+		frappe.delete_doc("Role", role, ignore_permissions=True, force=True)
+		print(f"  removed Role {role}")
+
+	# This app's workflows are already gone; anything still naming a state or
+	# action belongs to another workflow.
+	for state in _shared_records()["Workflow State"] + _created_lane_states():
+		if not (frappe.db.exists("Workflow State", state) and _created_by_app("Workflow State", state)):
+			continue
+		if (
+			frappe.db.exists("Workflow Document State", {"state": state})
+			or frappe.db.exists("Workflow Transition", {"state": state})
+			or frappe.db.exists("Workflow Transition", {"next_state": state})
+		):
+			continue
+		frappe.delete_doc("Workflow State", state, ignore_permissions=True, force=True)
+		print(f"  removed Workflow State {state}")
+	for action in _shared_records()["Workflow Action Master"]:
+		if not (
+			frappe.db.exists("Workflow Action Master", action)
+			and _created_by_app("Workflow Action Master", action)
+		):
+			continue
+		if frappe.db.exists("Workflow Transition", {"action": action}):
+			continue
+		frappe.delete_doc("Workflow Action Master", action, ignore_permissions=True, force=True)
+		print(f"  removed Workflow Action {action}")
+
+
+def _role_used_elsewhere(role, app_doctypes):
+	"""What outside this app still names `role`, or None.
+
+	Asking only about DocPerm rows deleted a role that another app's workflow
+	lets approve, or that a report, page or workspace is shown to — those then
+	pointed at a role that no longer existed. A user holding the role is not a
+	use: that assignment goes with the role.
+	"""
+	elsewhere = {"parent": ("not in", app_doctypes or [""])}
+	if frappe.db.exists("DocPerm", {"role": role, **elsewhere}) or frappe.db.exists(
+		"Custom DocPerm", {"role": role, **elsewhere}
+	):
+		return "another app's DocType permissions"
+
+	# This app's own workflows and notifications are removed before this runs.
+	not_ours = {"parent": ("not in", WORKFLOWS)}
+	if frappe.db.exists("Workflow Transition", {"allowed": role, **not_ours}) or frappe.db.exists(
+		"Workflow Document State", {"allow_edit": role, **not_ours}
+	):
+		return "another workflow"
+	if frappe.db.table_exists("Notification Recipient") and frappe.db.exists(
+		"Notification Recipient", {"receiver_by_role": role}
+	):
+		return "another Notification"
+
+	# Reports, pages, workspaces, role profiles ...: a row on one of this app's
+	# own records goes with that record when the app's modules are removed.
+	for row in frappe.get_all(
+		"Has Role",
+		filters={"role": role, "parenttype": ("!=", "User")},
+		fields=["parenttype", "parent"],
+		distinct=True,
+	):
+		meta = frappe.get_meta(row.parenttype)
+		if (
+			meta.has_field("module")
+			and frappe.db.get_value(row.parenttype, row.parent, "module") in APP_MODULES
+		):
+			continue
+		if (
+			meta.has_field("app")
+			and frappe.db.get_value(row.parenttype, row.parent, "app") == "finstein_visitor_management"
+		):
+			continue
+		return f"{row.parenttype} {row.parent}"
+	return None
+
+
+def _created_lane_states():
+	"""The "Pending <role>" lanes the workflow builder created for approver roles."""
+	prefix = _CREATED_MARKER.format(doctype="Workflow State", name="")
+	return [
+		row[0][len(prefix) :]
+		for row in frappe.db.sql("select defkey from tabDefaultValue where defkey like %s", (prefix + "%",))
+	]
+
+
+def _remove_scheduled_jobs():
+	for name in frappe.get_all(
+		"Scheduled Job Type", filters={"method": ("like", "finstein_visitor_management.%")}, pluck="name"
+	):
+		frappe.delete_doc("Scheduled Job Type", name, ignore_permissions=True, force=True)
+
+
+def _forget_setup_markers():
+	"""So a later reinstall starts from a clean slate instead of skipping setup."""
+	# Matched in Python: `\_` is an escape in MariaDB's LIKE but not in SQLite's,
+	# where the same pattern matched nothing and every marker survived — so a
+	# reinstall skipped its one-time setup (no guest uploads, no permissions).
+	for row in frappe.get_all(
+		"DefaultValue", filters={"parent": "__default", "defkey": ("like", "vms%")}, fields=["name", "defkey"]
+	):
+		if row.defkey.startswith("vms_"):
+			frappe.db.delete("DefaultValue", {"name": row.name})
+	frappe.clear_cache()

@@ -1,0 +1,182 @@
+/*
+ * Reusable Indian ID proof validators (browser-safe, framework-agnostic).
+ * Mirrors `finstein_visitor_management/visitor_management/validators.py`.
+ *
+ * Exposed as `window.VMS_IDValidators` so any Frappe web form / desk form /
+ * custom page script can call it. Pure JS — no jQuery, no Frappe deps.
+ *
+ * Canonical labels: "Aadhaar", "PAN Card", "Driving License", "Passport", "Voter ID".
+ * Aliases ("PAN", "DL", "EPIC") are accepted by validateID / idProofErrorMessage.
+ */
+(function (global) {
+	"use strict";
+
+	// ── Verhoeff tables (for Aadhaar) ───────────────────────────
+	const D = [
+		[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+		[1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+		[2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+		[3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+		[4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+		[5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+		[6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+		[7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+		[8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+		[9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+	];
+	const P = [
+		[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+		[1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+		[5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+		[8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+		[9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+		[4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+		[2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+		[7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+	];
+
+	function verhoeffChecksum(digits) {
+		let c = 0;
+		for (let i = 0; i < digits.length; i++) {
+			const d = parseInt(digits[digits.length - 1 - i], 10);
+			c = D[c][P[i % 8][d]];
+		}
+		return c;
+	}
+
+	// ── Primitive validators ────────────────────────────────────
+	const AADHAAR_RE = /^\d{12}$/;
+	const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
+	const DL_RE = /^[A-Z]{2}[0-9]{2}\s?[0-9]{11}$/;
+	const PASSPORT_RE = /^[A-Z]{1}[0-9]{7}$/;
+	// Voter ID (EPIC): 3 letters + 7 digits.
+	const EPIC_RE = /^[A-Z]{3}[0-9]{7}$/;
+
+	function strip(v) {
+		return String(v == null ? "" : v).replace(/\s+/g, "");
+	}
+	function stripHyphens(v) {
+		return String(v == null ? "" : v).replace(/[\s-]/g, "");
+	}
+
+	function validateAadhaar(number) {
+		const clean = stripHyphens(number);
+		if (!AADHAAR_RE.test(clean)) return false;
+		if (clean[0] === "0" || clean[0] === "1") return false;
+		return verhoeffChecksum(clean) === 0;
+	}
+
+	function validatePAN(number) {
+		return PAN_RE.test(strip(number).toUpperCase());
+	}
+
+	// A licence typed as printed ("MH-12-2011-0012345") carries hyphens and
+	// spaces that are not part of the number.
+	function validateDrivingLicense(number) {
+		return DL_RE.test(stripHyphens(number).toUpperCase());
+	}
+
+	function validatePassport(number) {
+		return PASSPORT_RE.test(strip(number).toUpperCase());
+	}
+
+	function validateVoterID(number) {
+		return EPIC_RE.test(stripHyphens(number).toUpperCase());
+	}
+
+	// ── Type dispatch ──────────────────────────────────────────
+	const CANONICAL = {
+		aadhaar: "Aadhaar",
+		aadhar: "Aadhaar",
+		uid: "Aadhaar",
+		pan: "PAN Card",
+		"pan card": "PAN Card",
+		dl: "Driving License",
+		"driving license": "Driving License",
+		"driving licence": "Driving License",
+		passport: "Passport",
+		"voter id": "Voter ID",
+		voter: "Voter ID",
+		epic: "Voter ID",
+		"voter id card": "Voter ID",
+	};
+	const VALIDATORS = {
+		Aadhaar: validateAadhaar,
+		"PAN Card": validatePAN,
+		"Driving License": validateDrivingLicense,
+		Passport: validatePassport,
+		"Voter ID": validateVoterID,
+	};
+
+	function canonicalType(idType) {
+		return (
+			CANONICAL[
+				String(idType == null ? "" : idType)
+					.trim()
+					.toLowerCase()
+			] || null
+		);
+	}
+
+	function validateID(idType, number) {
+		const label = canonicalType(idType);
+		// `label` is already constrained to a whitelisted canonical value, but
+		// resolve+call defensively: only own enumerable validators, never an
+		// inherited member (constructor, toString, …), and only if it's callable.
+		if (!label || !Object.prototype.hasOwnProperty.call(VALIDATORS, label)) return false;
+		const validator = VALIDATORS[label];
+		if (typeof validator !== "function") return false;
+		return validator(number);
+	}
+
+	function detectIDType(number) {
+		const order = ["Aadhaar", "PAN Card", "Driving License", "Passport", "Voter ID"];
+		for (let i = 0; i < order.length; i++) {
+			if (VALIDATORS[order[i]](number)) return order[i];
+		}
+		return null;
+	}
+
+	const ERROR_MESSAGES = {
+		Aadhaar:
+			"Aadhaar must be exactly 12 digits, must not start with 0 or 1, " +
+			"and must pass the UIDAI Verhoeff checksum.",
+		"PAN Card":
+			"PAN must be in the format ABCDE1234F " +
+			"(5 uppercase letters, 4 digits, 1 uppercase letter).",
+		"Driving License":
+			"Driving License must be in the format SS00 00000000000 " +
+			"(2 letters + 2 digits + optional space + 11 digits).",
+		Passport:
+			"Passport must be in the format A1234567 " +
+			"(1 uppercase letter followed by 7 digits).",
+		"Voter ID":
+			"Voter ID (EPIC) must be in the format ABC1234567 " +
+			"(3 letters followed by 7 digits).",
+	};
+
+	function idProofErrorMessage(idType) {
+		const label = canonicalType(idType) || idType;
+		// hasOwnProperty guard so an inherited key (e.g. "constructor") can't
+		// return a prototype function instead of the proper fallback message.
+		if (Object.prototype.hasOwnProperty.call(ERROR_MESSAGES, label)) {
+			return ERROR_MESSAGES[label];
+		}
+		return (
+			"Unsupported ID Proof Type: " +
+			JSON.stringify(idType) +
+			". Use Aadhaar, PAN Card, Driving License, Passport, or Voter ID."
+		);
+	}
+
+	global.VMS_IDValidators = {
+		validateAadhaar,
+		validatePAN,
+		validateDrivingLicense,
+		validatePassport,
+		validateVoterID,
+		detectIDType,
+		validateID,
+		idProofErrorMessage,
+	};
+})(typeof window !== "undefined" ? window : globalThis);

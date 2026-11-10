@@ -1,0 +1,26 @@
+<div style="font-family:Arial,sans-serif;font-size:14px;color:#1f2933;background-color:#ffffff;padding:14px;border-radius:6px;max-width:420px;">
+<p style="margin:0 0 8px;color:#1f2933;">Dear {{ (doc.visitor_full_name) | e }},</p>
+<p style="margin:0 0 10px;color:#1f2933;">Your visit is <b style="color:#1a7f37;">approved</b>. Reference: <b style="color:#1f2933;">{{ (doc.name) | e }}</b>.</p>
+<p style="margin:0 0 12px;color:#3e4c59;font-size:13px;line-height:1.7;word-break:break-word;">
+<b style="color:#5b6b7b;">When:</b> <span style="color:#1f2933;">{{ (doc.visit_date) | e }}, {{ (doc.expected_checkin) | e }}&ndash;{{ (doc.expected_checkout) | e }}</span><br>
+<b style="color:#5b6b7b;">Host:</b> <span style="color:#1f2933;">{{ (doc.host_name or doc.person_to_visit) | e }}</span> &middot; <b style="color:#5b6b7b;">Purpose:</b> <span style="color:#1f2933;">{{ (doc.purpose_of_visit) | e }}</span>
+</p>
+{% if doc.qr_code_image %}
+<div style="text-align:center;margin:16px 0;">
+<img src="{{ (doc.qr_code_image) | e }}" alt="Gate QR Code" style="width:180px;height:180px;border:1px solid #e2e8f0;padding:5px;background:#ffffff;">
+<div style="font-size:12px;color:#64748b;margin-top:6px;">Show this code at the security gate. You can also save this email or take a screenshot.</div>
+</div>
+{% else %}
+<p style="color:#b45309;">Your QR pass is being generated and will follow in a separate email shortly.</p>
+{% endif %}
+<p style="margin:0 0 6px;color:#102a43;font-weight:bold;">On arrival</p>
+<ul style="margin:0 0 12px;padding-left:20px;color:#1f2933;">
+<li style="color:#1f2933;">Carry a valid photo ID matching the one you registered with.</li>
+<li style="color:#1f2933;">Show the QR code above at the gate for verification.</li>
+<li style="color:#1f2933;">Your physical badge will be issued at the security desk after item verification.</li>
+{% if doc.visitor_type == 'Contractor' %}
+<li style="color:#1f2933;">Complete the required safety induction and wear the provided PPE.</li>
+{% endif %}
+</ul>
+<p style="margin:0;color:#64748b;font-size:12px;">This is an automated email. Contact your host for changes or queries.</p>
+</div>

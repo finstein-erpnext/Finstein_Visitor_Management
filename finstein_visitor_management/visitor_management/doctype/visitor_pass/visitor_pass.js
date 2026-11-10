@@ -1,0 +1,1386 @@
+// For license information, please see license.txt
+
+// Fill a field from a linked master ONLY when the user has not already typed
+// something there, and never blank it out.
+//
+// The three "link to an existing record" pickers (supplier_link, contractor_link,
+// job_applicant_link) used to call frm.set_value(..., master.field || '')
+// unconditionally. Two ways that went wrong, both reported live:
+//   - the master has no phone/email, so `|| ''` ERASED the visitor's real details
+//     that a receptionist had just typed, and the save then failed on mandatory
+//     fields — annoying but at least loud;
+//   - the master DOES have its own phone/email (a company switchboard, a
+//     recruiter's inbox), so the visitor's personal contact details were silently
+//     replaced and the save SUCCEEDED. Nobody notices, and the pass now carries
+//     the wrong way to reach that person — which is the whole point of the field.
+// A linked master is a convenience for blank fields, not an authority over what a
+// human just entered. Same "did a person choose this?" principle the server side
+// already applies to meal_type and special_diet in lifecycle.py.
+// Returns only the fields a pass copies from a picked Employee / Job Applicant /
+// Supplier, to anyone allowed to pick one — so no role needs full READ on them.
+const LINK_DETAILS_METHOD =
+	"finstein_visitor_management.visitor_management.link_details.get_link_details";
+// Pickers for masters other apps own: searched through this app's own query so
+// no role needs a permission on the ERPNext/HRMS DocType (see link_queries.py).
+const LINK_QUERY = "finstein_visitor_management.visitor_management.link_queries.search";
+const CORE_LINK_FIELDS = [
+	"person_to_visit",
+	"sales_executive",
+	"food_dept_staff_assigned",
+	"gate_verified_by",
+	"contractor_link",
+	"supplier_link",
+	"work_order_ref",
+	"job_applicant_link",
+];
+
+// A Customer pass can point at the CRM record the visit came from. Those DocTypes
+// are ERPNext's and this app grants nothing on them, so the two CRM fields are
+// offered only to someone who can read at least one — a host who cannot was
+// shown a picker that answered every keystroke with "403 Forbidden".
+const CRM_REFERENCE_TYPES = ["Lead", "Opportunity", "Customer"];
+
+function readable_crm_types() {
+	return CRM_REFERENCE_TYPES.filter((doctype) => frappe.model.can_read(doctype));
+}
+
+// "ID Proof Number" (id_proof_masked) holds what the person typed — or, once saved,
+// only the masked form (XXXXXX234F; see validators.mask_id_number). Returns the
+// typed full number, or "" while the field still shows the masked form.
+function typed_id_number(frm) {
+	const value = (frm.doc.id_proof_masked || "").trim();
+	const positions = [...value]
+		.map((ch, i) => (/[A-Za-z0-9]/.test(ch) ? i : -1))
+		.filter((i) => i >= 0);
+	const visible = new Set(positions.slice(-4));
+	const masked = [...value]
+		.map((ch, i) => (/[A-Za-z0-9]/.test(ch) && !visible.has(i) ? "X" : ch))
+		.join("");
+	const is_masked = positions.length > 4 && value.includes("X") && masked === value;
+	return is_masked ? "" : value;
+}
+
+function fill_if_blank(frm, fieldname, value) {
+	if (!value) {
+		return;
+	}
+	const current = frm.doc[fieldname];
+	if (current === undefined || current === null || String(current).trim() === "") {
+		frm.set_value(fieldname, value);
+	}
+}
+
+// VMS Settings → home_country rarely changes, so cache it for the desk
+// session instead of re-fetching from the server on every form refresh/
+// field-change.
+let _vms_home_country_cache = null;
+let _vms_home_country_promise = null;
+
+function get_vms_home_country() {
+	if (_vms_home_country_cache) {
+		return Promise.resolve(_vms_home_country_cache);
+	}
+	if (!_vms_home_country_promise) {
+		_vms_home_country_promise = frappe.db
+			.get_single_value("VMS Settings", "home_country")
+			.then((value) => {
+				_vms_home_country_cache = value || "India";
+				return _vms_home_country_cache;
+			});
+	}
+	return _vms_home_country_promise;
+}
+
+// Approval-lane vocabulary (which role a Visitor Type's pass is currently
+// awaiting) is generated server-side from the Visitor Type masters
+// (workflow_builder.approver_roles() / lane_for_role()) -- it is NOT a fixed
+// list. This file used to hardcode a 5-entry map keyed on Visitor Type name
+// (Contractor/Supplier/Customer/Candidate/VIP); any type routed to another
+// approver role -- e.g. "Auditor" -> Facility Manager -- showed no approver
+// name here. Fetched once and cached for the desk session,
+// same pattern as get_vms_home_country above -- a Visitor Type's approver
+// role changes rarely, and a normal page reload after such a change is
+// expected (same as any other masters-driven Desk vocabulary).
+let _visitor_type_approver_cache = null;
+let _visitor_type_approver_promise = null;
+
+function get_visitor_type_approvers() {
+	if (_visitor_type_approver_cache) {
+		return Promise.resolve(_visitor_type_approver_cache);
+	}
+	if (!_visitor_type_approver_promise) {
+		_visitor_type_approver_promise = frappe
+			.call({
+				method: "finstein_visitor_management.visitor_management.workflow_builder.get_visitor_type_approvers",
+			})
+			.then((r) => {
+				_visitor_type_approver_cache = r.message || {};
+				return _visitor_type_approver_cache;
+			});
+	}
+	return _visitor_type_approver_promise;
+}
+
+// Frappe's core Phone control defaults to the site's System Settings country
+// (e.g. India) the first time it renders, regardless of the visitor's actual
+// nationality. Once custom_nationality is set, nudge the phone widget's
+// displayed flag/ISD prefix to match it.
+function sync_mobile_country_with_nationality(frm) {
+	const country_name = frm.doc.custom_nationality;
+	if (!country_name) {
+		return;
+	}
+	const control = frm.get_field("mobile_number");
+	// `$isd` is the last piece the Phone control builds. Without checking it we
+	// can fire on_change before the control's DOM exists, and core's
+	// set_formatted_input then throws on `this.$isd.text()` — a console error on
+	// every new Visitor Pass form.
+	if (
+		control &&
+		control.country_codes &&
+		control.country_codes[country_name] &&
+		control.country_code_picker &&
+		control.$isd &&
+		control.$isd.length
+	) {
+		control.country_code_picker.on_change(country_name, false);
+	}
+}
+
+// Mirrors VisitorPass.VISIT_ONLY_FIELDS. Frappe copies no_copy fields on Amend
+// (frappe.model.copy_doc skips them only when not amending), so an amended copy
+// of a cancelled pass opened showing the old visit's approval, check-in times,
+// QR code and hospitality request. The server clears them on save as well.
+const VISIT_ONLY_FIELDS = [
+	"approved_by",
+	"approval_date",
+	"badge_number",
+	"qr_code_image",
+	"gate_verified_photo",
+	"gate_verified_on",
+	"gate_verified_by",
+	"actual_checkin",
+	"actual_checkout",
+	"no_show",
+	"current_location",
+	"item_verification_status",
+	"items_verified",
+	"all_items_verified",
+	"hospitality_request",
+	"hospitality_overall_status",
+	"food_status",
+	"food_dept_staff_assigned",
+];
+
+// Mirrors VisitorPass.LOCKED_WHILE_PENDING (plus the masked ID field people type into).
+const LOCKED_WHILE_PENDING = [
+	"visitor_full_name",
+	"id_proof_type",
+	"id_proof_masked",
+	"mobile_number",
+	"email_id",
+	"person_to_visit",
+	"visit_date",
+	"pass_valid_until",
+	"multi_day_pass",
+	"visitor_type",
+	"is_group_visit",
+	"group_members",
+];
+
+frappe.ui.form.on("Visitor Pass", {
+	setup(frm) {
+		CORE_LINK_FIELDS.forEach((fieldname) => {
+			frm.set_query(fieldname, () => ({ query: LINK_QUERY }));
+		});
+		// A retired type has no approval lane; the server refuses it too.
+		frm.set_query("visitor_type", () => ({ filters: { is_active: 1 } }));
+	},
+
+	onload(frm) {
+		if (frm.is_new() && frm.doc.amended_from) {
+			VISIT_ONLY_FIELDS.forEach((fieldname) => {
+				frm.doc[fieldname] = null;
+			});
+			frm.doc.status = "Draft";
+		}
+	},
+
+	refresh(frm) {
+		// The full ID number never reaches this form (it is hidden and at a level no
+		// role reads): "ID Proof Number" shows the masked copy, and Security and System
+		// Manager use "Reveal Full ID" (public/js/reveal_id.js) to see the whole number.
+		// A saved pass is shown as it is stored: opening it must not change it.
+		// The CRM default used to be applied on every refresh, so a Customer pass
+		// raised by a host who cannot read Leads (no CRM Reference Type) turned
+		// "Not Saved" the moment a Sales Manager opened it — the approval state
+		// and the Approve / Reject menu gave way to a Save button.
+		if (frm.is_new()) {
+			ensure_customer_crm_defaults(frm);
+		}
+		setup_supplier_pass_query(frm);
+		apply_visitor_pass_ui(frm);
+		add_action_buttons(frm);
+		add_hospitality_buttons(frm);
+		add_gate_buttons(frm);
+		render_hospitality_progress(frm);
+	},
+
+	visitor_type(frm) {
+		ensure_customer_crm_defaults(frm);
+		setup_supplier_pass_query(frm);
+		apply_visitor_pass_ui(frm);
+	},
+
+	// Fetched from the Visitor Type. It is what the CRM default and the field rules
+	// key off, and it can arrive after the visitor_type event has already run.
+	visitor_type_layout(frm) {
+		ensure_customer_crm_defaults(frm);
+		apply_visitor_pass_ui(frm);
+	},
+
+	custom_nationality(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	factory_tour_required(frm) {
+		if (frm.doc.factory_tour_required) {
+			if (!frm.doc.buggy_required) {
+				frm.set_value("buggy_required", 1);
+			}
+		} else if (frm.doc.buggy_required) {
+			frm.set_value("buggy_required", 0);
+		}
+	},
+
+	crm_reference_type(frm) {
+		if (frm.doc.crm_lead_opportunity) {
+			frm.set_value("crm_lead_opportunity", "");
+		}
+	},
+
+	crm_lead_opportunity(frm) {
+		fetch_customer_crm_details(frm);
+	},
+
+	supplier_link(frm) {
+		if (frm.doc.supplier_link) {
+			frappe.call({
+				method: LINK_DETAILS_METHOD,
+				args: {
+					doctype: "Supplier",
+					name: frm.doc.supplier_link,
+					reference_doctype: frm.doctype,
+				},
+				callback: function (r) {
+					if (r.message) {
+						fill_if_blank(frm, "visitor_full_name", r.message.supplier_name);
+						fill_if_blank(frm, "mobile_number", r.message.mobile_no);
+						fill_if_blank(frm, "email_id", r.message.email_id);
+						fill_if_blank(frm, "company__organisation", r.message.supplier_name);
+					}
+				},
+			});
+		}
+	},
+
+	contractor_link(frm) {
+		if (frm.doc.contractor_link) {
+			frappe.call({
+				method: LINK_DETAILS_METHOD,
+				args: {
+					doctype: "Supplier",
+					name: frm.doc.contractor_link,
+					reference_doctype: frm.doctype,
+				},
+				callback: function (r) {
+					if (r.message) {
+						fill_if_blank(frm, "visitor_full_name", r.message.supplier_name);
+						fill_if_blank(frm, "mobile_number", r.message.mobile_no);
+						fill_if_blank(frm, "email_id", r.message.email_id);
+						fill_if_blank(frm, "company__organisation", r.message.supplier_name);
+					}
+				},
+			});
+		}
+	},
+
+	job_applicant_link(frm) {
+		if (frm.doc.job_applicant_link) {
+			frappe.call({
+				method: LINK_DETAILS_METHOD,
+				args: {
+					doctype: "Job Applicant",
+					name: frm.doc.job_applicant_link,
+					reference_doctype: frm.doctype,
+				},
+				callback: function (r) {
+					if (r.message) {
+						fill_if_blank(frm, "visitor_full_name", r.message.applicant_name);
+						fill_if_blank(frm, "mobile_number", r.message.phone_number);
+						fill_if_blank(frm, "email_id", r.message.email_id);
+						frm.set_value("position_applied", r.message.job_title || "");
+					}
+				},
+			});
+		} else {
+			frm.set_value("position_applied", "");
+		}
+	},
+
+	person_to_visit(frm) {
+		// Was `fetch_from` on the three host fields, which needs READ on the whole
+		// Employee record; this returns only the name and department (see
+		// link_details.py). The host's email is filled in by the server on save.
+		frm.set_value({ host_name: "", host_department: "", host_email: "" });
+		if (!frm.doc.person_to_visit) {
+			return;
+		}
+		frappe.call({
+			method: LINK_DETAILS_METHOD,
+			args: {
+				doctype: "Employee",
+				name: frm.doc.person_to_visit,
+				reference_doctype: frm.doctype,
+			},
+			callback: function (r) {
+				const d = r.message || {};
+				frm.set_value({
+					host_name: d.employee_name || "",
+					host_department: d.department || "",
+				});
+			},
+		});
+	},
+
+	mobile_number(frm) {
+		preview_normalised_mobile(frm);
+		lookup_existing_visitor_match(frm, "mobile_number");
+	},
+
+	id_proof_masked(frm) {
+		// People type the full number here; once saved it shows only the last four.
+		lookup_existing_visitor_match(frm, "id_proof_masked");
+	},
+
+	supplier_visit_mode(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	entry_type(frm) {
+		if (frm.doc.entry_type === "New") {
+			frm.set_value("existing_visitor_pass", "");
+			frm.set_value("visitor_full_name", "");
+			frm.set_value("mobile_number", "");
+			frm.set_value("email_id", "");
+			frm.set_value("company__organisation", "");
+			frm.set_value("id_proof_type", "");
+			frm.set_value("id_proof_number", "");
+			frm.set_value("id_proof_masked", "");
+			// Clear type-specific links for whichever layout this type uses
+			const layout = frm.doc.visitor_type_layout || "";
+			if (layout === "Supplier") {
+				frm.set_value("supplier_link", "");
+			} else if (layout === "Customer") {
+				frm.set_value("crm_reference_type", "");
+				frm.set_value("crm_lead_opportunity", "");
+			} else if (layout === "Contractor") {
+				frm.set_value("contractor_link", "");
+				frm.set_value("work_order_ref", "");
+			} else if (layout === "Candidate") {
+				frm.set_value("job_applicant_link", "");
+			}
+		}
+
+		ensure_customer_crm_defaults(frm);
+		apply_visitor_pass_ui(frm);
+	},
+
+	existing_visitor_pass(frm) {
+		if (!frm.doc.existing_visitor_pass) {
+			apply_visitor_pass_ui(frm);
+			return;
+		}
+
+		frappe.call({
+			method: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.get_existing_visitor_pass_details",
+			args: {
+				visitor_pass: frm.doc.existing_visitor_pass,
+				visitor_type: frm.doc.visitor_type,
+			},
+			callback: ({ message }) => {
+				if (!message) {
+					return;
+				}
+				apply_existing_pass_data(frm, message);
+				apply_visitor_pass_ui(frm);
+			},
+		});
+	},
+
+	meeting_outcome(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	meal_required(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	refreshments_required(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	visit_date(frm) {
+		refresh_hospitality_plan(frm);
+	},
+
+	expected_checkin(frm) {
+		refresh_hospitality_plan(frm);
+	},
+
+	expected_checkout(frm) {
+		refresh_hospitality_plan(frm);
+	},
+
+	interpreter_required(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	multi_day_pass(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	status(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	workflow_state(frm) {
+		apply_visitor_pass_ui(frm);
+	},
+
+	// Reject asks for the reason the host will be shown; Withdraw, which cannot
+	// be undone, asks once. Frappe freezes the page before this runs, so it is
+	// unfrozen for the dialog. Resolving lets Frappe apply the action; a promise
+	// that never settles stops it.
+	before_workflow_action(frm) {
+		const action = frm.selected_workflow_action;
+		if (action === "Reject") {
+			frappe.dom.unfreeze();
+			ask_rejection_reason(frm);
+			return new Promise(() => {});
+		}
+		if (action === "Withdraw") {
+			frappe.dom.unfreeze();
+			return new Promise((resolve) => {
+				frappe.confirm(
+					__(
+						"Withdraw this pass? The visit is called off and the pass cannot be used again."
+					),
+					() => {
+						frappe.dom.freeze();
+						resolve();
+					},
+					() => {
+						frm.selected_workflow_action = null;
+					}
+				);
+			});
+		}
+	},
+});
+
+function ask_rejection_reason(frm) {
+	// Saved and rejected in one server call (visitor_pass.reject_with_reason), so a
+	// refused Reject leaves no reason behind on the pass. VMS Settings may make the
+	// reason optional (VisitorPass.onload: require_rejection_reason); the server
+	// applies the same switch.
+	const required = (frm.doc.__onload || {}).require_rejection_reason !== false;
+	const dialog = new frappe.ui.Dialog({
+		title: __("Reject Visitor Pass"),
+		fields: [
+			{
+				fieldname: "reason",
+				fieldtype: "Small Text",
+				label: required ? __("Reason") : __("Reason (optional)"),
+				description: __("The host will see this."),
+				reqd: required ? 1 : 0,
+			},
+		],
+		primary_action_label: __("Reject"),
+		primary_action({ reason }) {
+			dialog.hide();
+			frappe
+				.xcall(
+					"finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.reject_with_reason",
+					{ name: frm.doc.name, reason },
+					"POST",
+					{ freeze: true }
+				)
+				.then(() => frm.reload_doc());
+		},
+	});
+	dialog.onhide = () => {
+		frm.selected_workflow_action = null;
+	};
+	dialog.show();
+}
+
+function preview_normalised_mobile(frm) {
+	// Show reception what the number they typed will be saved as — or that it
+	// will be refused — while they can still correct it (a wrong number means
+	// security cannot reach the visitor). The answer comes from the server's own
+	// rule: this hint used to rebuild the number itself and said "Format looks
+	// good" for anything it did not rewrite, "12345" included.
+	const raw = (frm.doc.mobile_number || "").trim();
+	const set_hint = (description) => {
+		frm.set_df_property("mobile_number", "description", description);
+		frm.refresh_field("mobile_number");
+	};
+	if (!raw) {
+		set_hint("");
+		return;
+	}
+	frappe.call({
+		method: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.check_mobile_number",
+		args: { mobile_number: raw },
+		silent: true,
+		error: () => set_hint(""),
+		callback: ({ message }) => {
+			// Typed on since the question was asked.
+			if (!message || (frm.doc.mobile_number || "").trim() !== raw) return;
+			const esc = frappe.utils.escape_html;
+			if (!message.valid) {
+				set_hint(`<span class="text-danger">${esc(message.message || "")}</span>`);
+			} else if (message.saved_as !== raw) {
+				set_hint(__("Will be saved as: <b>{0}</b>", [esc(message.saved_as)]));
+			} else {
+				set_hint(__("✓ Valid mobile number"));
+			}
+		},
+	});
+}
+
+function apply_visitor_pass_ui(frm) {
+	apply_visitor_pass_field_rules(frm);
+	set_visitor_pass_intro(frm);
+	if (frm.dashboard) frm.dashboard.clear_headline();
+	show_blacklist_warning(frm);
+	apply_badge_visibility(frm);
+
+	// Force Phone widget to re-render if mobile_number exists but display is blank.
+	// Frappe's Phone control sometimes fails to parse "+91 XXXXXXXXXX" on initial load.
+	if (frm.doc.mobile_number) {
+		setTimeout(() => {
+			const field = frm.get_field("mobile_number");
+			if (field && field.$input && !field.$input.val()) {
+				frm.refresh_field("mobile_number");
+			}
+		}, 400);
+	}
+}
+
+// A draft whose visitor is on the active blacklist says so for as long as it is
+// open. The server works the match out on every load and after every save
+// (VisitorPass.onload). The warning used to be a dialog queued by the save alone,
+// and the first save of a new pass — when the form moves to the saved record and
+// Frappe closes open dialogs on the way — showed nothing.
+function show_blacklist_warning(frm) {
+	const match = frm.doc.__onload && frm.doc.__onload.blacklist_match;
+	if (!match || !frm.dashboard || frm.doc.docstatus !== 0) return;
+	const esc = frappe.utils.escape_html;
+	frm.dashboard.set_headline_alert(
+		__(
+			"<b>Blacklisted visitor — do not proceed.</b> {0} is on the active blacklist (reason: {1}). This pass can be kept as a draft but cannot be sent for approval. Stop collecting their documents.",
+			[esc(match.visitor_name || ""), esc(match.reason || __("Not specified"))]
+		),
+		"red",
+		true
+	);
+}
+
+// Hide badge_number / badge_colour when VMS Settings → enable_badge is off.
+// Also respects badge_required_for (per-visitor-type opt-in list).
+// Uses set_df_property("hidden", 1) + refresh_field — the most reliable
+// force-hide in Frappe; toggle_display alone can flicker if the field
+// was already painted before the async settings fetch resolved.
+function apply_badge_visibility(frm) {
+	const BADGE_FIELDS = ["badge_number", "badge_colour"];
+	const setHidden = (hide) => {
+		BADGE_FIELDS.forEach((fn) => {
+			frm.set_df_property(fn, "hidden", hide ? 1 : 0);
+			frm.toggle_display(fn, !hide);
+			frm.refresh_field(fn);
+		});
+	};
+	// Hide first so we never flash badge fields on before the fetch resolves.
+	setHidden(true);
+	frappe.db
+		.get_value("VMS Settings", "VMS Settings", ["enable_badge", "badge_required_for"])
+		.then((r) => {
+			const s = (r && r.message) || {};
+			// Single-doctype fields come back as strings — "0" is truthy in JS.
+			// Coerce to int with cint to get a real boolean.
+			let show = !!cint(s.enable_badge);
+			if (show) {
+				const list = (s.badge_required_for || "")
+					.split(/[\n,]/)
+					.map((x) => x.trim())
+					.filter(Boolean);
+				if (list.length && frm.doc.visitor_type && !list.includes(frm.doc.visitor_type)) {
+					show = false;
+				}
+			}
+			setHidden(!show);
+		});
+}
+
+// Keeps the two CRM fields in step with the kind of pass: a default CRM Reference
+// Type for a new customer, nothing for anyone else. It changes the pass, so it
+// runs when the pass is being prepared — a new form, or the user changing the
+// Visitor Type or Entry Type — and never because a saved pass was opened. The
+// server clears the two fields on save as well (_clear_fields_from_other_layouts).
+function ensure_customer_crm_defaults(frm) {
+	if (
+		frm.doc.visitor_type_layout === "Customer" &&
+		frm.doc.entry_type === "New" &&
+		!frm.doc.crm_reference_type
+	) {
+		// The first kind of CRM record this user can pick from, if any.
+		const [first_type] = readable_crm_types();
+		if (first_type) frm.set_value("crm_reference_type", first_type);
+		return;
+	}
+
+	if (frm.doc.visitor_type_layout !== "Customer" || frm.doc.entry_type !== "New") {
+		if (frm.doc.crm_reference_type || frm.doc.crm_lead_opportunity) {
+			frm.set_value({
+				crm_reference_type: "",
+				crm_lead_opportunity: "",
+			});
+		}
+	}
+}
+
+function fetch_customer_crm_details(frm) {
+	if (
+		frm.doc.visitor_type_layout !== "Customer" ||
+		!frm.doc.crm_reference_type ||
+		!frm.doc.crm_lead_opportunity
+	) {
+		return;
+	}
+
+	// The server returns the five values a pass takes from the record and nothing
+	// else, with the record's owner already resolved to an Employee. This used to
+	// read the whole record with frappe.client.get, overwrite whatever had been
+	// typed, and put the owner — a User — into Sales Executive, which links to
+	// Employee: the pass then could not be saved at all.
+	const reference_name = frm.doc.crm_lead_opportunity;
+	frappe.call({
+		method: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.get_crm_reference_details",
+		args: { reference_type: frm.doc.crm_reference_type, reference_name },
+		callback: ({ message }) => {
+			// Nothing to copy, or another record picked while this one was loading.
+			if (!message || frm.doc.crm_lead_opportunity !== reference_name) {
+				return;
+			}
+
+			// A convenience for blank fields, never an authority over what a
+			// person has typed (see fill_if_blank).
+			[
+				"visitor_full_name",
+				"mobile_number",
+				"email_id",
+				"company__organisation",
+				"sales_executive",
+			].forEach((fieldname) => fill_if_blank(frm, fieldname, message[fieldname]));
+
+			if (message.owner_without_employee && !frm.doc.sales_executive) {
+				frappe.show_alert(
+					{
+						message: __(
+							"CRM owner {0} has no linked Employee, so Sales Executive was not auto-filled.",
+							[frappe.utils.escape_html(message.owner_without_employee)]
+						),
+						indicator: "orange",
+					},
+					7
+				);
+			}
+		},
+	});
+}
+
+function apply_visitor_pass_field_rules(frm) {
+	// Field rules key off the Visitor Type's *layout* (visitor_type_layout, fetched
+	// from Visitor Type.detail_layout) rather than its name, so a site can add a
+	// type that reuses the Supplier/Customer/Contractor/Candidate/VIP layout and
+	// gets the same behaviour with no code change.
+	const layout = frm.doc.visitor_type_layout || "";
+	const is_supplier_existing = layout === "Supplier" && frm.doc.entry_type === "Existing";
+	const is_existing =
+		["Supplier", "Customer", "Contractor", "Candidate"].includes(layout) &&
+		frm.doc.entry_type === "Existing";
+	const is_follow_up = layout === "Customer" && frm.doc.meeting_outcome === "Follow-Up Needed";
+	const needs_interpreter = layout === "VIP" && !!frm.doc.interpreter_required;
+	const is_multi_day_contractor = layout === "Contractor" && !!frm.doc.multi_day_pass;
+	const hospitality_requested =
+		!!frm.doc.meal_required || !!frm.doc.refreshments_required || !!frm.doc.conference_room;
+	const hospitality_recorded = hospitality_requested || !!frm.doc.hospitality_request;
+
+	[
+		"status",
+		"workflow_state",
+		"approval_date",
+		"approved_by",
+		"badge_number",
+		"qr_code_image",
+		"gate_verified_photo",
+		"gate_verified_on",
+		"gate_verified_by",
+		"host_department",
+		"item_verification_status",
+		"items_verified",
+		"all_items_verified",
+		"actual_checkin",
+		"actual_checkout",
+		"no_show",
+		"current_location",
+		"hospitality_request",
+	].forEach((fieldname) => frm.set_df_property(fieldname, "read_only", 1));
+
+	frm.set_df_property("items_verification_status", "hidden", 1);
+	frm.toggle_display("existing_visitor_pass", is_existing);
+	frm.toggle_reqd("existing_visitor_pass", is_existing);
+	frm.toggle_display("supplier_link", layout === "Supplier" && frm.doc.entry_type === "New");
+	// Only the kinds of CRM record this user can read are offered (plus the kind
+	// already on the pass, so a saved value still shows as what it is).
+	const crm_types = readable_crm_types();
+	const show_crm = layout === "Customer" && frm.doc.entry_type === "New" && crm_types.length > 0;
+	const crm_options = CRM_REFERENCE_TYPES.filter(
+		(doctype) => crm_types.includes(doctype) || doctype === frm.doc.crm_reference_type
+	);
+	// A blank first option: a pass can be saved with no CRM reference (every pass
+	// raised by someone who cannot read CRM records is), and without it the field
+	// showed "Lead" for such a pass while the pass itself held nothing.
+	frm.set_df_property("crm_reference_type", "options", ["", ...crm_options].join("\n"));
+	frm.toggle_display("crm_reference_type", show_crm);
+	frm.toggle_display("crm_lead_opportunity", show_crm);
+	frm.toggle_display("contractor_link", layout === "Contractor" && frm.doc.entry_type === "New");
+	frm.toggle_display("work_order_ref", layout === "Contractor" && frm.doc.entry_type === "New");
+	frm.toggle_display(
+		"job_applicant_link",
+		layout === "Candidate" && frm.doc.entry_type === "New"
+	);
+	const is_supplier_meeting = layout === "Supplier" && frm.doc.supplier_visit_mode === "Meeting";
+	frm.toggle_reqd("meeting_subject", is_supplier_meeting);
+
+	frm.toggle_display("followup_date", is_follow_up);
+	frm.toggle_reqd("followup_date", is_follow_up);
+
+	frm.toggle_display("interpreter_language", needs_interpreter);
+	frm.toggle_reqd("interpreter_language", needs_interpreter);
+
+	frm.toggle_display("pass_valid_until", is_multi_day_contractor);
+	frm.toggle_reqd("pass_valid_until", is_multi_day_contractor);
+
+	// While the pass awaits approval only a System Manager may change who is coming
+	// and when; the server refuses it for everyone else (_lock_details_while_pending).
+	const locked =
+		frm.doc.docstatus === 0 &&
+		String(frm.doc.workflow_state || "").startsWith("Pending") &&
+		!frappe.user.has_role("System Manager");
+	LOCKED_WHILE_PENDING.forEach((fieldname) =>
+		frm.set_df_property(fieldname, "read_only", locked ? 1 : 0)
+	);
+
+	// Hospitality field visibility is now DocType-driven:
+	//   - assigned_meal_slots, hospitality_type, food_dept_staff_assigned,
+	//     food_status, service_time, refreshments_required → hidden:1 in JSON
+	//   - meal_type, number_of_people → depends_on:eval:doc.meal_required in JSON
+	// special_diet, hospitality_request are always visible (no toggle needed).
+	frm.toggle_display("conference_room", true);
+	frm.toggle_display("hospitality_notes", hospitality_recorded);
+
+	sync_mobile_country_with_nationality(frm);
+
+	get_vms_home_country().then((home_country) => {
+		const is_foreign_national =
+			frm.doc.custom_nationality && frm.doc.custom_nationality !== home_country;
+		frm.toggle_display("custom_visa_copy", is_foreign_national);
+		frm.toggle_reqd("custom_visa_copy", is_foreign_national);
+
+		// id_proof_type is a Link to the ID Proof Type master, so the foreign
+		// national restriction is a link filter on the master's own flag rather
+		// than rewriting a hardcoded Select option list.
+		frm.set_query("id_proof_type", () => {
+			const filters = { is_active: 1 };
+			if (is_foreign_national) {
+				filters.valid_for_foreign_nationals = 1;
+			}
+			return { filters };
+		});
+
+		// Clear a now-invalid selection when the visitor turns out to be foreign.
+		if (is_foreign_national && frm.doc.id_proof_type) {
+			frappe.db
+				.get_value("ID Proof Type", frm.doc.id_proof_type, "valid_for_foreign_nationals")
+				.then((r) => {
+					if (r && r.message && !r.message.valid_for_foreign_nationals) {
+						frm.set_value("id_proof_type", "");
+					}
+				});
+		}
+	});
+}
+
+function refresh_hospitality_plan(frm) {
+	if (!frm.doc.visit_date || !frm.doc.expected_checkin || !frm.doc.expected_checkout) {
+		frm.set_value({
+			meal_required: 0,
+			meal_type: "",
+			assigned_meal_slots: "",
+			hospitality_type: "",
+			service_time: null,
+		});
+		apply_visitor_pass_ui(frm);
+		return;
+	}
+
+	// The desk's own preview. The portal's guest endpoint is limited to 60 calls
+	// an hour per IP address, which a front desk behind one office address used
+	// up — and its refusal opened a dialog that swallowed Ctrl+S. This is only a
+	// preview (the server works the plan out again on save), so a failure of any
+	// kind is never put in front of the user.
+	frappe.call({
+		method: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.get_meal_plan_preview",
+		args: {
+			visit_date: frm.doc.visit_date,
+			expected_checkin: frm.doc.expected_checkin,
+			expected_checkout: frm.doc.expected_checkout,
+		},
+		silent: true,
+		error: () => {},
+		callback: ({ message }) => {
+			if (!message) {
+				return;
+			}
+
+			frm.set_value({
+				meal_required: message.meal_required || 0,
+				meal_type: message.meal_type || "",
+				assigned_meal_slots: message.assigned_meal_slots || "",
+				hospitality_type: message.hospitality_type || "",
+				service_time: message.service_time || null,
+			});
+			apply_visitor_pass_ui(frm);
+		},
+	});
+}
+
+function set_visitor_pass_intro(frm) {
+	const stage = get_pass_stage(frm);
+
+	// Clear approver card at the start; it's re-rendered only for Pending stages.
+	clear_approver_context_card(frm);
+
+	if (frm.is_new()) {
+		frm.set_intro(
+			__(
+				"Complete the Visitor Profile and Visit Plan first, then fill the section that matches the selected visitor type before submitting."
+			),
+			"blue"
+		);
+		return;
+	}
+
+	if (stage.startsWith("Pending")) {
+		// Generic text first (correct for every lane, including one from a
+		// Visitor Type created seconds ago), upgraded to the specific approver
+		// name once the server-driven lane map resolves.
+		frm.set_intro(
+			__("Awaiting approval. Review the visitor details before taking action."),
+			"orange"
+		);
+		render_approver_context_card(frm);
+
+		// A pass routed to the host's manager names them (approval_tasks); say who.
+		if (frm.doc.routed_approver) {
+			frm.set_intro(
+				__("Awaiting approval from {0}, the host's manager.", [
+					frappe.utils.escape_html(frappe.user.full_name(frm.doc.routed_approver)),
+				]),
+				"orange"
+			);
+			return;
+		}
+
+		get_visitor_type_approvers().then((approvers) => {
+			// The form may have moved on (record switched, or no longer
+			// pending) while this call was in flight -- don't stomp its intro.
+			if (!get_pass_stage(frm).startsWith("Pending")) return;
+			const approval_lane = approvers[frm.doc.visitor_type];
+			if (approval_lane) {
+				frm.set_intro(
+					__(
+						"Awaiting approval from {0}. Review the request snapshot and visit-specific details carefully.",
+						[approval_lane]
+					),
+					"orange"
+				);
+			}
+		});
+		return;
+	}
+
+	if (stage === "Approved") {
+		frm.set_intro(
+			__(
+				frm.doc.visitor_type_layout === "VIP"
+					? "Approved. Security should use the VIP priority lane and issue the badge during gate check-in."
+					: "Approved. Security can now verify declared items, issue the badge, and record the visitor check-in."
+			),
+			"green"
+		);
+		return;
+	}
+
+	if (stage === "Items Verified") {
+		frm.set_intro(
+			__(
+				"Items are verified and the pass is gate-ready. Proceed with Security Log check-in."
+			),
+			"blue"
+		);
+		return;
+	}
+
+	if (stage === "Checked-In") {
+		frm.set_intro(
+			__(
+				"Visitor is currently inside the premises. Use Security Log to record checkout when they exit."
+			),
+			"green"
+		);
+		return;
+	}
+
+	if (stage === "Checked-Out") {
+		frm.set_intro(__("Visit completed and gate exit recorded."), "blue");
+		return;
+	}
+
+	if (stage === "Rejected") {
+		const reason = frm.doc.rejection_reason
+			? " " + __("Reason: {0}", [frappe.utils.escape_html(frm.doc.rejection_reason)])
+			: "";
+		frm.set_intro(
+			__(
+				"Request rejected. Update the details and reapply if the visit still needs to happen."
+			) + reason,
+			"red"
+		);
+		return;
+	}
+
+	if (stage === "Withdrawn") {
+		frm.set_intro(__("Withdrawn. This visit was called off before it was decided."), "gray");
+		return;
+	}
+
+	frm.set_intro(null);
+}
+
+function render_approver_context_card(frm) {
+	// One-glance card for approvers: visit details + attachment checklist.
+	// Intentionally NO SLA timer and NO risk badge — kept minimal so approvers
+	// see only verifiable facts about the request.
+	if (!frm.dashboard || !frm.dashboard.wrapper) return;
+
+	const photo_ok = !!frm.doc.visitor_photo;
+	const id_ok = !!frm.doc.id_proof_scan;
+	const items_declared =
+		(frm.doc.visitor_items || []).length > 0 || !!(frm.doc.items_carried || "").trim();
+
+	const esc = (v) => frappe.utils.escape_html(v == null ? "" : String(v));
+
+	const checklist_item = (label, ok) => `
+		<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; background:${
+			ok ? "#d9f3e4" : "#fde2e2"
+		}; color:${ok ? "#0d6b3e" : "#9b1c1c"};">
+			${ok ? "✅" : "⚠️"} ${label}
+		</span>
+	`;
+
+	const meta_row = (label, value) => `
+		<div style="font-size:12px; color:#334e68; line-height:1.6;">
+			<strong>${label}:</strong> ${value || "-"}
+		</div>
+	`;
+
+	const visit_window = [
+		esc(frm.doc.visit_date || ""),
+		esc(frm.doc.expected_checkin || ""),
+		frm.doc.expected_checkout ? "→ " + esc(frm.doc.expected_checkout) : "",
+	]
+		.filter(Boolean)
+		.join(" ");
+
+	const html = `
+		<div class="vm-approver-card" style="border:1px solid #dbe3ea; border-radius:12px; padding:14px 16px; background:linear-gradient(180deg,#f8fafc 0%, #eef4f8 100%); margin-bottom:12px;">
+			<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
+				<div style="font-size:13px; font-weight:700; color:#102a43;">
+					${__("Approver Snapshot")}
+				</div>
+				<div style="display:flex; gap:6px; flex-wrap:wrap;">
+					${checklist_item(__("Visitor Photo"), photo_ok)}
+					${checklist_item(__("ID Scan"), id_ok)}
+					${checklist_item(__("Items Declared"), items_declared)}
+				</div>
+			</div>
+			<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:8px;">
+				${meta_row(__("Visitor"), esc(frm.doc.visitor_full_name))}
+				${meta_row(__("Type"), esc(frm.doc.visitor_type))}
+				${meta_row(__("Company"), esc(frm.doc.company__organisation))}
+				${meta_row(__("Host"), esc(frm.doc.person_to_visit))}
+				${meta_row(__("Visit Window"), visit_window)}
+				${meta_row(__("Purpose"), esc(frm.doc.purpose_of_visit))}
+			</div>
+		</div>
+	`;
+
+	clear_approver_context_card(frm);
+	const $headline = frm.dashboard.wrapper.find(".form-headline").first();
+	const $target = $headline.length ? $headline : $(frm.dashboard.wrapper);
+	$target.before(`<div class="vm-approver-card-host">${html}</div>`);
+}
+
+function clear_approver_context_card(frm) {
+	if (!frm.dashboard || !frm.dashboard.wrapper) return;
+	frm.dashboard.wrapper.parent().find(".vm-approver-card-host").remove();
+}
+
+function add_action_buttons(frm) {
+	// "Actions" group removed — "Open Hospitality" is already available
+	// under the "Hospitality" group (see add_hospitality_buttons).
+	return;
+}
+
+function setup_supplier_pass_query(frm) {
+	if (!["Supplier", "Customer", "Contractor", "Candidate"].includes(frm.doc.visitor_type))
+		return;
+
+	frm.set_query("existing_visitor_pass", () => ({
+		query: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.search_visitor_passes",
+		filters: {
+			visitor_type: frm.doc.visitor_type,
+		},
+	}));
+}
+
+function get_pass_stage(frm) {
+	return frm.doc.workflow_state || frm.doc.status || __("Draft");
+}
+
+// get_approval_lane(visitor_type) used to live here as a hardcoded 5-entry
+// map. Removed: its one caller (set_visitor_pass_intro) now resolves the
+// approver name through get_visitor_type_approvers() above, which reads the
+// live Visitor Type -> approver-role vocabulary instead of a fixed list.
+
+function get_pass_stage_color(stage) {
+	// Pending-lane state names are generated as `Pending <approver role>` for
+	// every role a Visitor Type configures (workflow_builder.lane_for_role) --
+	// there is no fixed list to enumerate, and the generic status fallback
+	// ("Pending Approval") shares the same prefix. The prefix IS the shared
+	// vocabulary: this used to be a hardcoded 6-entry list that silently
+	// stopped matching the moment a Visitor Type routed to a role outside it.
+	if (["Approved", "Checked-In"].includes(stage)) return "green";
+	if (String(stage || "").startsWith("Pending")) return "orange";
+	if (["Rejected", "Cancelled", "Withdrawn"].includes(stage)) return "red";
+	if (["Items Verified", "Checked-Out"].includes(stage)) return "blue";
+	return "gray";
+}
+
+function apply_existing_pass_data(frm, data) {
+	const fields = [
+		"visitor_full_name",
+		"mobile_number",
+		"email_id",
+		"company__organisation",
+		"id_proof_type",
+		"id_proof_number",
+		"id_proof_masked",
+		"id_proof_scan",
+		"visitor_photo",
+		// Not the visit itself: the old pass's date, times, host and purpose used to
+		// overwrite what reception had just typed for this one.
+		"supplier_visit_mode",
+		"supplier_link",
+		"meeting_subject",
+		"refreshments_required",
+		"nda_required",
+		"documents_shared",
+		"crm_reference_type",
+		"crm_lead_opportunity",
+		"visit_category",
+		"sales_executive",
+		"products_discussed",
+		"meeting_outcome",
+		"meeting_minutes",
+		"contractor_link",
+		"work_order_ref",
+		"tools_list",
+		"job_applicant_link",
+		"position_applied",
+		"candidate_interview_type",
+		"interview_panel",
+	];
+
+	const updates = {};
+	fields.forEach((fieldname) => {
+		if (Object.prototype.hasOwnProperty.call(data, fieldname)) {
+			updates[fieldname] = data[fieldname];
+		}
+	});
+	// The ID number arrives masked (last four only); the server copies the real one
+	// from this source pass on save (id_numbers.py).
+	updates.id_proof_source = data.name || "";
+	frm.set_value(updates);
+}
+
+function lookup_existing_visitor_match(frm, trigger_field) {
+	if (
+		!frm.doc.visitor_type_layout ||
+		!["Supplier", "Customer", "Contractor", "Candidate"].includes(frm.doc.visitor_type_layout)
+	) {
+		return;
+	}
+	const typed_id = typed_id_number(frm);
+	if (!frm.doc.mobile_number && !typed_id) {
+		return;
+	}
+
+	frappe.call({
+		method: "finstein_visitor_management.visitor_management.doctype.visitor_pass.visitor_pass.get_existing_visitor_matches",
+		args: {
+			visitor_type: frm.doc.visitor_type,
+			id_proof_number: typed_id,
+			mobile_number: frm.doc.mobile_number,
+			exclude_name: frm.doc.name,
+		},
+		callback: ({ message }) => {
+			if (!message || !message.best_match) {
+				return;
+			}
+
+			const best = message.best_match;
+			const signature = `${best.name}:${trigger_field}:${typed_id}:${
+				frm.doc.mobile_number || ""
+			}`;
+			if (frm.__last_existing_prompt_signature === signature) {
+				return;
+			}
+			frm.__last_existing_prompt_signature = signature;
+
+			const prompt = __(
+				"Existing {0} record found: {1} ({2}). Do you want to load this data?",
+				[
+					frappe.utils.escape_html(best.visitor_type || ""),
+					frappe.utils.escape_html(best.name || ""),
+					frappe.utils.escape_html(best.visitor_full_name || ""),
+				]
+			);
+
+			frappe.confirm(prompt, () => {
+				if (frm.doc.entry_type !== "Existing") {
+					frm.set_value("entry_type", "Existing");
+				}
+				frm.set_value("existing_visitor_pass", best.name);
+			});
+		},
+	});
+}
+
+function add_hospitality_buttons(frm) {
+	if (frm.is_new()) return;
+
+	if (frm.doc.hospitality_request) {
+		frm.add_custom_button(
+			__("View Itinerary"),
+			() => {
+				const url =
+					`/printview?doctype=${encodeURIComponent("Hospitality Request")}` +
+					`&name=${encodeURIComponent(frm.doc.hospitality_request)}` +
+					`&format=${encodeURIComponent("Visitor Itinerary")}` +
+					`&no_letterhead=0`;
+				window.open(url, "_blank");
+			},
+			__("Hospitality")
+		);
+
+		frm.add_custom_button(
+			__("Open Hospitality Request"),
+			() => {
+				frappe.set_route("Form", "Hospitality Request", frm.doc.hospitality_request);
+			},
+			__("Hospitality")
+		);
+	} else {
+		const any_arrangement =
+			frm.doc.cab_required ||
+			frm.doc.hotel_required ||
+			frm.doc.factory_tour_required ||
+			frm.doc.buggy_required ||
+			frm.doc.greeting_required ||
+			frm.doc.meal_required ||
+			frm.doc.conference_room;
+		if (any_arrangement) {
+			frm.add_custom_button(
+				__("Create Hospitality Request"),
+				() => {
+					frappe.new_doc("Hospitality Request", {
+						visitor_pass: frm.doc.name,
+					});
+				},
+				__("Hospitality")
+			);
+		}
+	}
+}
+
+// Gate check-in/out: visitor_gate.visitor_checkin/visitor_checkout validate the
+// movement server-side and hand back the prefilled Security Log route where the
+// officer completes qr_code_scanned/photo_at_gate/id_proof_match/pass_photo_match
+// (SecurityLog.before_save requires all four, so these endpoints deliberately do
+// not insert the log themselves -- see visitor_gate.py's module docstring).
+function call_gate_endpoint(frm, method) {
+	frappe.call({
+		method: `finstein_visitor_management.visitor_management.api.visitor_gate.${method}`,
+		args: { docname: frm.doc.name },
+		freeze: true,
+		callback: (r) => {
+			if (!r.message) return;
+			frappe.show_alert({ message: r.message.message, indicator: "green" });
+			window.location.href = r.message.route;
+		},
+	});
+}
+
+// Same window as visitor_gate._valid_today: the visit date, or visit_date ..
+// pass_valid_until for a multi-day pass. Checking out does not end it.
+function pass_valid_today(frm) {
+	const { visit_date, multi_day_pass, pass_valid_until, expected_checkin, expected_checkout } =
+		frm.doc;
+	if (!visit_date) return false;
+	const today = frappe.datetime.get_today();
+	const last_day = multi_day_pass && pass_valid_until ? pass_valid_until : visit_date;
+	if (visit_date <= today && today <= last_day) return true;
+	// An overnight visit (check-out at or before check-in, 22:00 to 06:00) runs past
+	// midnight: the last day's visit still counts the next morning, until check-out.
+	const overnight =
+		expected_checkin && expected_checkout && expected_checkout <= expected_checkin;
+	return Boolean(
+		overnight &&
+			today === frappe.datetime.add_days(last_day, 1) &&
+			frappe.datetime.now_time() < expected_checkout
+	);
+}
+
+function add_gate_buttons(frm) {
+	// Only a submitted (approved) pass reaches the gate — never a draft or a cancelled one.
+	if (frm.is_new() || frm.doc.docstatus !== 1) return;
+	// Only the gate records movements; for anyone else the button only led to
+	// "Security role required".
+	if (!frappe.user.has_role(["Security", "System Manager"])) return;
+
+	const stage = frm.doc.status;
+	// A visitor who stepped out comes back in on the same pass.
+	const reentry = stage === "Checked-Out" && pass_valid_today(frm);
+
+	if (["Approved", "Items Verified"].includes(stage) || reentry) {
+		frm.add_custom_button(__("Check In"), () => call_gate_endpoint(frm, "visitor_checkin"));
+	}
+
+	if (stage === "Checked-In") {
+		frm.add_custom_button(__("Check Out"), () => call_gate_endpoint(frm, "visitor_checkout"));
+	}
+}
+
+// The host's answer to "is it arranged?": each service asked for, how far it has
+// got, and the details they need (driver, hotel, guide). Read from the request
+// by get_hospitality_progress, which answers only somebody who may read both the
+// pass and its request. Added as a dashboard section: Frappe removes "custom"
+// sections itself on the next refresh, so the card never lingers on another pass.
+const HOSPITALITY_CARD_CLASS = "vm-hospitality-progress";
+const HOSPITALITY_STATUS_COLOURS = {
+	Pending: ["#fff4e5", "#9a5b00"],
+	Booked: ["#e0f2fe", "#075985"],
+	Done: ["#d9f3e4", "#0d6b3e"],
+	Cancelled: ["#f1f5f9", "#475569"],
+};
+
+function render_hospitality_progress(frm) {
+	if (
+		frm.is_new() ||
+		!frm.doc.hospitality_request ||
+		!frm.dashboard ||
+		!frm.dashboard.add_section
+	)
+		return;
+	const docname = frm.doc.name;
+	frappe
+		.xcall(
+			"finstein_visitor_management.visitor_management.doctype.hospitality_request.hospitality_request.get_hospitality_progress",
+			{ visitor_pass: docname }
+		)
+		.then((data) => {
+			const request = data && data.request;
+			if (!request || frm.doc.name !== docname || !(request.services || []).length) return;
+			const esc = (v) => frappe.utils.escape_html(v == null ? "" : String(v));
+			const state = request.workflow_state || "Draft";
+			let heading = __("Hospitality: being arranged");
+			if (request.status === "Cancelled" || ["Rejected", "Cancelled"].includes(state)) {
+				heading = __("Hospitality: called off");
+			} else if (state === "Draft") {
+				heading = __("Hospitality: waiting for this pass to be approved");
+			} else if (state === "Pending Approval") {
+				heading = __("Hospitality: waiting for the Hospitality Manager");
+			} else if (request.status === "Completed") {
+				heading = __("Hospitality: completed");
+			}
+			const rows = request.services.map((service) => {
+				const [bg, fg] =
+					HOSPITALITY_STATUS_COLOURS[service.status] ||
+					HOSPITALITY_STATUS_COLOURS.Pending;
+				const details = (service.details || [])
+					.map(([label, value]) => `${esc(label)}: <b>${esc(value)}</b>`)
+					.join(" · ");
+				return `
+					<div style="display:flex; gap:10px; align-items:baseline; padding:4px 0; border-top:1px solid var(--border-color); flex-wrap:wrap;">
+						<span style="min-width:110px; font-weight:600;">${esc(service.label)}</span>
+						<span style="padding:1px 8px; border-radius:999px; font-size:11px; font-weight:700; background:${bg}; color:${fg};">${esc(
+					__(service.status)
+				)}</span>
+						<span style="font-size:12px; overflow-wrap:anywhere;">${details}</span>
+					</div>`;
+			});
+			const html = `
+				<div style="width:100%;">
+					<div style="display:flex; justify-content:space-between; gap:10px; margin-bottom:6px; flex-wrap:wrap;">
+						<div style="font-size:13px; font-weight:700;">${esc(heading)}</div>
+						<a href="${frappe.utils.get_form_link(
+							"Hospitality Request",
+							request.name
+						)}" style="font-size:12px;">${esc(request.name)}</a>
+					</div>
+					${rows.join("")}
+				</div>`;
+			frm.dashboard.parent &&
+				frm.dashboard.parent.find(`.${HOSPITALITY_CARD_CLASS}`).remove();
+			frm.dashboard.add_section(html, null, `custom ${HOSPITALITY_CARD_CLASS}`);
+			frm.dashboard.show();
+		})
+		.catch(() => {
+			// No access to the request, or it was removed: the pass shows nothing extra.
+		});
+}
