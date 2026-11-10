@@ -1,9 +1,9 @@
 [project]
-name = "visitormanagement"
+name = "Finsteinvisitormanagement"
 authors = [
-    { name = "Finstein", email = "yuvaraj.s@finstein.ai"}
+    { name = "Finstein", email = "erpnext@finstein.ai"}
 ]
-description = "Visitor Management System"
+description = "Finstein Visitor Management"
 requires-python = ">=3.10"
 readme = "README.md"
 version = "1.0.0"
